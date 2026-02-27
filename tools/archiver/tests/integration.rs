@@ -1,0 +1,459 @@
+#![cfg(feature = "nats_integration_tests")]
+
+use archiver::Args;
+
+use sha2::Digest;
+use shared::{
+    log,
+    nats_subjects::Subject,
+    nats_util,
+    prost::Message,
+    protobuf::{
+        ebpf_extractor::{
+            addrman::{self, InsertNew},
+            connection::{self, Connection, InboundConnection},
+            ebpf,
+            mempool::{self, Added},
+            message::{self, message_event::Msg, Metadata, Ping},
+            validation::{self, BlockConnected},
+            Ebpf,
+        },
+        event::{event::PeerObserverEvent, Event},
+        log_extractor::{self, LogDebugCategory},
+        p2p_extractor, rpc_extractor,
+    },
+    simple_logger,
+    testing::{nats_publisher::NatsPublisherForTesting, nats_server::NatsServerForTesting},
+    tokio::{self, sync::watch, time::sleep},
+};
+use std::{
+    fs::File,
+    io::{BufReader, Read},
+    sync::Once,
+    time::Duration,
+};
+
+static INIT: Once = Once::new();
+
+fn setup() {
+    INIT.call_once(|| {
+        simple_logger::SimpleLogger::new()
+            .with_level(log::LevelFilter::Info)
+            .init()
+            .unwrap();
+    });
+}
+
+fn make_test_args(nats_port: u16, output_dir: &std::path::Path) -> Args {
+    Args {
+        // aqui nao deveria ser Args::new?
+        nats: nats_util::NatsArgs {
+            address: format!("127.0.0.1:{}", nats_port),
+            username: None,
+            password: None,
+            password_file: None,
+        },
+        output_dir: output_dir.to_path_buf(),
+        base_name: "test".to_string(),
+        max_file_size: 1_073_741_824, // nao seria melhor pegar o valor direto de um arquivo configuravel?
+        log_level: log::Level::Info,
+        messages: false,
+        connections: false,
+        addrman: false,
+        mempool: false,
+        validation: false,
+        rpc: false,
+        p2p_extractor: false,
+        log_extractor: false,
+    }
+}
+
+fn make_all_event_types() -> Vec<(Event, &'static str)> {
+    vec![
+        // 1. ebpf message
+        (
+            Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
+                ebpf_event: Some(ebpf::EbpfEvent::Message(message::MessageEvent {
+                    meta: Metadata {
+                        peer_id: 0,
+                        addr: "127.0.0.1:8333".to_string(),
+                        conn_type: 1,
+                        command: "ping".to_string(),
+                        inbound: true,
+                        size: 8,
+                    },
+                    msg: Some(Msg::Ping(Ping { value: 1337 })),
+                })),
+            }))
+            .unwrap(),
+            "messages",
+        ),
+        // 2. ebpf connection
+        (
+            Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
+                ebpf_event: Some(ebpf::EbpfEvent::Connection(connection::ConnectionEvent {
+                    event: Some(connection::connection_event::Event::Inbound(
+                        InboundConnection {
+                            conn: Connection {
+                                addr: "127.0.0.1:8333".to_string(),
+                                conn_type: 1,
+                                network: 1,
+                                peer_id: 1,
+                            },
+                            existing_connections: 10,
+                        },
+                    )),
+                })),
+            }))
+            .unwrap(),
+            "connections",
+        ),
+        // 3. ebpf addrman
+        (
+            Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
+                ebpf_event: Some(ebpf::EbpfEvent::Addrman(addrman::AddrmanEvent {
+                    event: Some(addrman::addrman_event::Event::New(InsertNew {
+                        addr: "127.0.0.1:8333".to_string(),
+                        addr_as: 1,
+                        bucket: 1,
+                        bucket_pos: 1,
+                        inserted: true,
+                        source: "127.0.0.1:8333".to_string(),
+                        source_as: 0,
+                    })),
+                })),
+            }))
+            .unwrap(),
+            "addrman",
+        ),
+        // 4. ebpf mempool
+        (
+            Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
+                ebpf_event: Some(ebpf::EbpfEvent::Mempool(mempool::MempoolEvent {
+                    event: Some(mempool::mempool_event::Event::Added(Added {
+                        txid: vec![0u8; 32],
+                        vsize: 250,
+                        fee: 1000,
+                    })),
+                })),
+            }))
+            .unwrap(),
+            "mempool",
+        ),
+        // 5. ebpf validation
+        (
+            Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
+                ebpf_event: Some(ebpf::EbpfEvent::Validation(validation::ValidationEvent {
+                    event: Some(validation::validation_event::Event::BlockConnected(
+                        BlockConnected {
+                            hash: vec![0u8; 32],
+                            height: 800000,
+                            transactions: 3000,
+                            inputs: 5000,
+                            sigops: 10000,
+                            connection_time: 500000,
+                        },
+                    )),
+                })),
+            }))
+            .unwrap(),
+            "validation",
+        ),
+        // 6. rpc
+        (
+            Event::new(PeerObserverEvent::RpcExtractor(rpc_extractor::Rpc {
+                rpc_event: Some(rpc_extractor::rpc::RpcEvent::Uptime(12345)),
+            }))
+            .unwrap(),
+            "rpc",
+        ),
+        // 7. p2p_extractor
+        (
+            Event::new(PeerObserverEvent::P2pExtractor(p2p_extractor::P2p {
+                p2p_event: Some(p2p_extractor::p2p::P2pEvent::PingDuration(
+                    p2p_extractor::PingDuration { duration: 500000 },
+                )),
+            }))
+            .unwrap(),
+            "p2p_extractor",
+        ),
+        // 8. log_extractor
+        (
+            Event::new(PeerObserverEvent::LogExtractor(log_extractor::Log {
+                category: LogDebugCategory::Unknown.into(),
+                log_timestamp: 1234,
+                threadname: String::new(),
+                log_level: log_extractor::LogLevel::Info.into(),
+                log_line_bytes: 8,
+                log_event: Some(log_extractor::log::LogEvent::UnknownLogMessage(
+                    log_extractor::UnknownLogMessage {
+                        raw_message: "test log".to_string(),
+                    },
+                )),
+            }))
+            .unwrap(),
+            "log_extractor",
+        ),
+    ]
+}
+
+async fn run_filter_test(flag: &str, expected_count: usize) {
+    setup();
+
+    let tmp_dir = std::env::temp_dir().join(format!("archiver_test_{}", flag));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    let nats_server = NatsServerForTesting::new(&[]).await;
+    let nats_publisher = NatsPublisherForTesting::new(nats_server.port).await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let dir = tmp_dir.clone();
+    let flag_owned = flag.to_string();
+    let archiver_handle = tokio::spawn(async move {
+        let mut args = make_test_args(nats_server.port, &dir);
+        match flag_owned.as_str() {
+            "messages" => args.messages = true,
+            "connections" => args.connections = true,
+            "addrman" => args.addrman = true,
+            "mempool" => args.mempool = true,
+            "validation" => args.validation = true,
+            "rpc" => args.rpc = true,
+            "p2p_extractor" => args.p2p_extractor = true,
+            "log_extractor" => args.log_extractor = true,
+            _ => {} // show_all
+        }
+        archiver::run(args, shutdown_rx).await.unwrap();
+    });
+
+    sleep(Duration::from_secs(1)).await;
+
+    let all_events = make_all_event_types();
+    for (event, _label) in &all_events {
+        nats_publisher
+            .publish(Subject::NetMsg.to_string(), event.encode_to_vec())
+            .await;
+    }
+
+    sleep(Duration::from_millis(500)).await;
+    shutdown_tx.send(true).unwrap();
+    archiver_handle.await.unwrap();
+
+    // ler e verificar
+    let file = File::open(tmp_dir.join("test.0.bin")).unwrap();
+    let mut reader = BufReader::new(file);
+
+    let mut header = [0u8; 16];
+    reader.read_exact(&mut header).unwrap();
+    assert_eq!(&header[0..8], b"POBS_ARC");
+
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).unwrap();
+
+    let mut decoded_events = Vec::new();
+    let mut cursor = 0;
+    while cursor < buf.len() {
+        let event = Event::decode_length_delimited(&buf[cursor..]).unwrap();
+        let size = event.encoded_len();
+        let varint_len = shared::prost::length_delimiter_len(size);
+        cursor += varint_len + size;
+        decoded_events.push(event);
+    }
+
+    assert_eq!(decoded_events.len(), expected_count);
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_filter_all() {
+    run_filter_test("all", 8).await;
+}
+
+#[tokio::test]
+async fn test_filter_messages() {
+    run_filter_test("messages", 1).await;
+}
+
+#[tokio::test]
+async fn test_filter_connections() {
+    run_filter_test("connections", 1).await;
+}
+
+#[tokio::test]
+async fn test_filter_addrman() {
+    run_filter_test("addrman", 1).await;
+}
+
+#[tokio::test]
+async fn test_filter_mempool() {
+    run_filter_test("mempool", 1).await;
+}
+
+#[tokio::test]
+async fn test_filter_validation() {
+    run_filter_test("validation", 1).await;
+}
+
+#[tokio::test]
+async fn test_filter_rpc() {
+    run_filter_test("rpc", 1).await;
+}
+
+#[tokio::test]
+async fn test_filter_p2p_extractor() {
+    run_filter_test("p2p_extractor", 1).await;
+}
+
+#[tokio::test]
+async fn test_filter_log_extractor() {
+    run_filter_test("log_extractor", 1).await;
+}
+
+#[tokio::test]
+async fn test_file_rotation() {
+    setup();
+
+    let tmp_dir = std::env::temp_dir().join("archiver_test_rotation");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    let nats_server = NatsServerForTesting::new(&[]).await;
+    let nats_publisher = NatsPublisherForTesting::new(nats_server.port).await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let dir = tmp_dir.clone();
+    let archiver_handle = tokio::spawn(async move {
+        let mut args = make_test_args(nats_server.port, &dir);
+        args.max_file_size = 100; // force rotation after ~1-2 events
+        archiver::run(args, shutdown_rx).await.unwrap();
+    });
+
+    sleep(Duration::from_secs(1)).await;
+
+    let all_events = make_all_event_types();
+    for (event, _label) in &all_events {
+        nats_publisher
+            .publish(Subject::NetMsg.to_string(), event.encode_to_vec())
+            .await;
+    }
+
+    sleep(Duration::from_millis(500)).await;
+    shutdown_tx.send(true).unwrap();
+    archiver_handle.await.unwrap();
+
+    // count how many .bin files were created
+    let bin_files: Vec<_> = std::fs::read_dir(&tmp_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path()
+                .extension()
+                .map(|ext| ext == "bin")
+                .unwrap_or(false)
+        })
+        .collect();
+
+    assert!(
+        bin_files.len() > 1,
+        "expected multiple files from rotation, got {}",
+        bin_files.len()
+    );
+
+    // read all files and count total events
+    let mut total_events = 0;
+    for entry in &bin_files {
+        let file = File::open(entry.path()).unwrap();
+        let mut reader = BufReader::new(file);
+
+        let mut header = [0u8; 16];
+        reader.read_exact(&mut header).unwrap();
+        assert_eq!(&header[0..8], b"POBS_ARC");
+
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).unwrap();
+
+        let mut cursor = 0;
+        while cursor < buf.len() {
+            let event = Event::decode_length_delimited(&buf[cursor..]).unwrap();
+            let size = event.encoded_len();
+            let varint_len = shared::prost::length_delimiter_len(size);
+            cursor += varint_len + size;
+            total_events += 1;
+        }
+    }
+
+    println!("\n========== ROTATION TEST ==========");
+    println!("files created: {}", bin_files.len());
+    println!("total events:  {}", total_events);
+    println!("===================================\n");
+
+    assert_eq!(total_events, 8);
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_compression_integrity() {
+    setup();
+
+    let tmp_dir = std::env::temp_dir().join("archiver_test_compression");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    let nats_server = NatsServerForTesting::new(&[]).await;
+    let nats_publisher = NatsPublisherForTesting::new(nats_server.port).await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let dir = tmp_dir.clone();
+    let archiver_handle = tokio::spawn(async move {
+        let mut args = make_test_args(nats_server.port, &dir);
+        args.max_file_size = 100;
+        args.compression_level = 3;
+        archiver::run(args, shutdown_rx).await.unwrap();
+    });
+
+    sleep(Duration::from_secs(1)).await;
+
+    let all_events = make_all_event_types();
+    for (event, _) in &all_events {
+        nats_publisher
+            .publish(Subject::NetMsg.to_string(), event.encode_to_vec())
+            .await;
+    }
+
+    sleep(Duration::from_millis(500)).await;
+    shutdown_tx.send(true).unwrap();
+    archiver_handle.await.unwrap();
+
+    let manifest_str = std::fs::read_to_string(tmp_dir.join("test.manifest.toml")).unwrap();
+    let manifest: toml::Value = manifest_str.parse().unwrap();
+    let files = manifest["files"].as_array().unwrap();
+
+    for entry in files {
+        let zst_name = entry["name"].as_str().unwrap();
+        let expected_checksum = entry["checksum"].as_str().unwrap();
+
+        let zst_path = tmp_dir.join(zst_name);
+        let bin_path = tmp_dir.join(zst_name.strip_suffix(".zst").unwrap());
+
+        assert!(zst_path.exists(), "{} should exist", zst_name);
+        assert!(
+            !bin_path.exists(),
+            "{} should have been deleted",
+            bin_path.display()
+        );
+
+        let file = File::open(&zst_path).unwrap();
+        let mut decoder = zstd::Decoder::new(file).unwrap();
+        let mut decompressed = Vec::new();
+        decoder.read_to_end(&mut decompressed).unwrap();
+
+        let actual_checksum = format!("{:x}", sha2::Sha256::digest(&decompressed));
+
+        assert_eq!(
+            actual_checksum, expected_checksum,
+            "decompressed SHA-256 of {} must match manifest checksum",
+            zst_name
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
