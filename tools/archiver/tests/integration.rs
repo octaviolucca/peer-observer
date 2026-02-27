@@ -26,12 +26,7 @@ use shared::{
     testing::{nats_publisher::NatsPublisherForTesting, nats_server::NatsServerForTesting},
     tokio::{self, sync::watch, time::sleep},
 };
-use std::{
-    fs::File,
-    io::{BufReader, Read},
-    sync::Once,
-    time::Duration,
-};
+use std::{fs::File, io::Read, sync::Once, time::Duration};
 
 static INIT: Once = Once::new();
 
@@ -46,7 +41,6 @@ fn setup() {
 
 fn make_test_args(nats_port: u16, output_dir: &std::path::Path) -> Args {
     Args {
-        // aqui nao deveria ser Args::new?
         nats: nats_util::NatsArgs {
             address: format!("127.0.0.1:{}", nats_port),
             username: None,
@@ -55,7 +49,7 @@ fn make_test_args(nats_port: u16, output_dir: &std::path::Path) -> Args {
         },
         output_dir: output_dir.to_path_buf(),
         base_name: "test".to_string(),
-        max_file_size: 1_073_741_824, // nao seria melhor pegar o valor direto de um arquivo configuravel?
+        max_file_size: 104_857_600,
         log_level: log::Level::Info,
         messages: false,
         connections: false,
@@ -65,6 +59,7 @@ fn make_test_args(nats_port: u16, output_dir: &std::path::Path) -> Args {
         rpc: false,
         p2p_extractor: false,
         log_extractor: false,
+        compression_level: 22,
     }
 }
 
@@ -238,13 +233,12 @@ async fn run_filter_test(flag: &str, expected_count: usize) {
     shutdown_tx.send(true).unwrap();
     archiver_handle.await.unwrap();
 
-    // ler e verificar
-    let file = File::open(tmp_dir.join("test.0.bin")).unwrap();
-    let mut reader = BufReader::new(file);
+    let file = File::open(tmp_dir.join("test.0.bin.zst")).unwrap();
+    let mut reader = zstd::Decoder::new(file).unwrap();
 
     let mut header = [0u8; 16];
     reader.read_exact(&mut header).unwrap();
-    assert_eq!(&header[0..8], b"POBS_ARC");
+    assert_eq!(&header[0..2], b"PA");
 
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf).unwrap();
@@ -340,33 +334,28 @@ async fn test_file_rotation() {
     shutdown_tx.send(true).unwrap();
     archiver_handle.await.unwrap();
 
-    // count how many .bin files were created
-    let bin_files: Vec<_> = std::fs::read_dir(&tmp_dir)
+    // count how many .bin.zst files were created
+    let zst_files: Vec<_> = std::fs::read_dir(&tmp_dir)
         .unwrap()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .map(|ext| ext == "bin")
-                .unwrap_or(false)
-        })
+        .filter(|e| e.path().to_string_lossy().ends_with(".bin.zst"))
         .collect();
 
     assert!(
-        bin_files.len() > 1,
+        zst_files.len() > 1,
         "expected multiple files from rotation, got {}",
-        bin_files.len()
+        zst_files.len()
     );
 
-    // read all files and count total events
+    // decompress and count total events
     let mut total_events = 0;
-    for entry in &bin_files {
+    for entry in &zst_files {
         let file = File::open(entry.path()).unwrap();
-        let mut reader = BufReader::new(file);
+        let mut reader = zstd::Decoder::new(file).unwrap();
 
         let mut header = [0u8; 16];
         reader.read_exact(&mut header).unwrap();
-        assert_eq!(&header[0..8], b"POBS_ARC");
+        assert_eq!(&header[0..2], b"PA");
 
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).unwrap();
@@ -382,7 +371,7 @@ async fn test_file_rotation() {
     }
 
     println!("\n========== ROTATION TEST ==========");
-    println!("files created: {}", bin_files.len());
+    println!("files created: {}", zst_files.len());
     println!("total events:  {}", total_events);
     println!("===================================\n");
 
@@ -454,6 +443,61 @@ async fn test_compression_integrity() {
             zst_name
         );
     }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
+async fn test_no_compression() {
+    setup();
+
+    let tmp_dir = std::env::temp_dir().join("archiver_test_no_compression");
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    let nats_server = NatsServerForTesting::new(&[]).await;
+    let nats_publisher = NatsPublisherForTesting::new(nats_server.port).await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let dir = tmp_dir.clone();
+    let archiver_handle = tokio::spawn(async move {
+        let mut args = make_test_args(nats_server.port, &dir);
+        args.compression_level = 0;
+        archiver::run(args, shutdown_rx).await.unwrap();
+    });
+
+    sleep(Duration::from_secs(1)).await;
+
+    let all_events = make_all_event_types();
+    for (event, _) in &all_events {
+        nats_publisher
+            .publish(Subject::NetMsg.to_string(), event.encode_to_vec())
+            .await;
+    }
+
+    sleep(Duration::from_millis(500)).await;
+    shutdown_tx.send(true).unwrap();
+    archiver_handle.await.unwrap();
+
+    // should be .bin, not .bin.zst
+    let bin_path = tmp_dir.join("test.0.bin");
+    let zst_path = tmp_dir.join("test.0.bin.zst");
+    assert!(bin_path.exists(), "test.0.bin should exist");
+    assert!(!zst_path.exists(), "test.0.bin.zst should not exist");
+
+    // manifest should reference .bin
+    let manifest_str = std::fs::read_to_string(tmp_dir.join("test.manifest.toml")).unwrap();
+    let manifest: toml::Value = manifest_str.parse().unwrap();
+    let files = manifest["files"].as_array().unwrap();
+    assert_eq!(files[0]["name"].as_str().unwrap(), "test.0.bin");
+
+    // checksum should match raw file content
+    let raw = std::fs::read(&bin_path).unwrap();
+    let actual_checksum = format!("{:x}", sha2::Sha256::digest(&raw));
+    let expected_checksum = files[0]["checksum"].as_str().unwrap();
+    assert_eq!(
+        actual_checksum, expected_checksum,
+        "SHA-256 of raw .bin must match manifest checksum"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

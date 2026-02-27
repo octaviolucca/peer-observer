@@ -2,6 +2,15 @@ mod error;
 
 pub use error::RuntimeError;
 
+use std::collections::HashSet;
+use std::fs::{self, File};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
 use shared::clap;
 use shared::clap::Parser;
 use shared::futures::stream::StreamExt;
@@ -12,18 +21,6 @@ use shared::protobuf::ebpf_extractor::ebpf;
 use shared::protobuf::event::event::PeerObserverEvent;
 use shared::protobuf::event::Event;
 use shared::tokio::sync::watch;
-use shared::tokio::task::JoinHandle;
-use std::path::PathBuf;
-
-use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{BufReader, BufWriter, Write};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use serde::Serialize;
-use sha2::{Digest, Sha256};
-
-type CompressionResult = std::io::Result<(u64, usize)>;
 
 const MAGIC: [u8; 2] = *b"PA";
 const VERSION: u8 = 1;
@@ -33,17 +30,17 @@ include!(concat!(env!("OUT_DIR"), "/git_hash.rs"));
 struct ArchiveHeader {
     magic: [u8; 2],
     version: u8,
-    git_hash: [u8; 3],
-    reserved: [u8; 10],
+    git_hash: [u8; 4],
+    reserved: [u8; 9],
 }
 
 impl ArchiveHeader {
-    fn new(git_hash: [u8; 3]) -> Self {
+    fn new(git_hash: [u8; 4]) -> Self {
         Self {
             magic: MAGIC,
             version: VERSION,
             git_hash,
-            reserved: [0u8; 10],
+            reserved: [0u8; 9],
         }
     }
 
@@ -51,8 +48,8 @@ impl ArchiveHeader {
         let mut buf = [0u8; HEADER_SIZE];
         buf[0..2].copy_from_slice(&self.magic);
         buf[2] = self.version;
-        buf[3..6].copy_from_slice(&self.git_hash);
-        buf[6..16].copy_from_slice(&self.reserved);
+        buf[3..7].copy_from_slice(&self.git_hash);
+        buf[7..16].copy_from_slice(&self.reserved);
         buf
     }
 }
@@ -82,7 +79,158 @@ struct FileEntry {
     last_timestamp: u64,
     event_types: Vec<String>,
     checksum: String,
-    compressed_size: u64,
+}
+
+/// Holds session-level state that persists across file rotations.
+struct SessionState {
+    created_at: u64,
+    file_index: u32,
+    manifest_files: Vec<FileEntry>,
+}
+
+impl SessionState {
+    fn new() -> Self {
+        Self {
+            created_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            file_index: 0,
+            manifest_files: Vec::new(),
+        }
+    }
+}
+
+enum ArchiveWriter {
+    Plain(BufWriter<File>),
+    Zstd(zstd::Encoder<'static, BufWriter<File>>),
+}
+
+impl ArchiveWriter {
+    fn new(file: File, compression_level: i32) -> std::io::Result<Self> {
+        if compression_level > 0 {
+            Ok(Self::Zstd(zstd::Encoder::new(
+                BufWriter::new(file),
+                compression_level,
+            )?))
+        } else {
+            Ok(Self::Plain(BufWriter::new(file)))
+        }
+    }
+
+    fn finish(self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(mut writer) => writer.flush(),
+            Self::Zstd(encoder) => {
+                let mut inner = encoder.finish()?;
+                inner.flush()?;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Write for ArchiveWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(writer) => writer.write(buf),
+            Self::Zstd(encoder) => encoder.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(writer) => writer.flush(),
+            Self::Zstd(encoder) => encoder.flush(),
+        }
+    }
+}
+
+/// Holds all mutable state for the currently open archive file.
+/// Tracks bytes written, event counts, timestamps, and event types
+/// so that the main event loop only needs to call write_event() and
+/// check needs_rotation().
+struct ArchiveFile {
+    path: PathBuf,
+    writer: ArchiveWriter,
+    hasher: Sha256,
+    bytes_written: u64,
+    events: u64,
+    first_timestamp: u64,
+    last_timestamp: u64,
+    event_types: HashSet<&'static str>,
+}
+
+impl ArchiveFile {
+    fn new(
+        output_dir: &Path,
+        base_name: &str,
+        index: u32,
+        compression_level: i32,
+    ) -> std::io::Result<Self> {
+        let ext = if compression_level > 0 {
+            "bin.zst"
+        } else {
+            "bin"
+        };
+        let path = output_dir.join(format!("{}.{}.{}", base_name, index, ext));
+        let file = File::create(&path)?;
+        let mut writer = ArchiveWriter::new(file, compression_level)?;
+        let mut hasher = Sha256::new();
+        // header: 16 bytes = MAGIC "PA" (2B) + VERSION (1B) + GIT_HASH (4B) + reserved (9B)
+        let header_bytes = ArchiveHeader::new(GIT_HASH).to_bytes();
+        writer.write_all(&header_bytes)?;
+        hasher.update(header_bytes);
+        writer.flush()?;
+        Ok(Self {
+            path,
+            writer,
+            hasher,
+            bytes_written: HEADER_SIZE as u64,
+            events: 0,
+            first_timestamp: 0,
+            last_timestamp: 0,
+            event_types: HashSet::new(),
+        })
+    }
+
+    fn write_event(&mut self, event: &Event) -> std::io::Result<()> {
+        let buf = event.encode_length_delimited_to_vec();
+        self.writer.write_all(&buf)?;
+        self.hasher.update(&buf);
+        self.bytes_written += buf.len() as u64;
+        self.events += 1;
+        if self.first_timestamp == 0 {
+            self.first_timestamp = event.timestamp;
+        }
+        self.last_timestamp = event.timestamp;
+        if let Some(name) = event_type_name(event) {
+            self.event_types.insert(name);
+        }
+        Ok(())
+    }
+
+    fn needs_rotation(&self, max_file_size: u64) -> bool {
+        self.bytes_written >= max_file_size
+    }
+
+    fn finalize(self, name: String) -> std::io::Result<(PathBuf, FileEntry)> {
+        self.writer.finish()?;
+        let checksum = format!("{:x}", self.hasher.finalize());
+        let mut sorted_types: Vec<String> =
+            self.event_types.into_iter().map(String::from).collect();
+        sorted_types.sort();
+        let entry = FileEntry {
+            name,
+            size_bytes: self.bytes_written,
+            events: self.events,
+            first_timestamp: self.first_timestamp,
+            last_timestamp: self.last_timestamp,
+            event_types: sorted_types,
+            checksum,
+        };
+        Ok((self.path, entry))
+    }
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -100,7 +248,7 @@ pub struct Args {
     #[arg(short, long, default_value = "archive")]
     pub base_name: String,
 
-    /// Maximum file size in bytes before rotation (default: 1GB).
+    /// Maximum uncompressed file size in bytes before rotation (default: 1GB).
     #[arg(long, default_value_t = 1_073_741_824)]
     pub max_file_size: u64,
 
@@ -140,7 +288,7 @@ pub struct Args {
     #[arg(long)]
     pub log_extractor: bool,
 
-    /// Zstd compression level (0 = no compression, 3 = default, 22 = ultra).
+    /// Zstd compression level (0 = no compression, 1-22). Default: 22 (ultra).
     #[arg(long, default_value_t = 22)]
     pub compression_level: i32,
 }
@@ -181,103 +329,32 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     let mut sub = nc.subscribe("*").await?;
     log::info!("Connected to NATS-server at {}", args.nats.address);
 
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-
     fs::create_dir_all(&args.output_dir)?;
-    let mut file_index: u32 = 0;
-    let mut bytes_written: u64 = 16; // header
-    let (mut file_path, mut writer, mut hasher) =
-        create_archive_file(&args.output_dir, &args.base_name, file_index)?;
-    log::info!("Created archive file: {}", file_path.display());
-
-    let mut event_count: u64 = 0;
-    let mut file_events: u64 = 0;
-    let mut first_timestamp: u64 = 0;
-    let mut last_timestamp: u64 = 0;
-    let mut event_types: HashSet<String> = HashSet::new();
-    let mut manifest_files: Vec<FileEntry> = Vec::new();
-    let mut compression_handle: Option<JoinHandle<CompressionResult>> = None;
+    let mut session = SessionState::new();
+    let mut current_file = ArchiveFile::new(
+        &args.output_dir,
+        &args.base_name,
+        session.file_index,
+        args.compression_level,
+    )?;
+    log::info!("Created archive file: {}", current_file.path.display());
 
     loop {
         shared::tokio::select! {
             maybe_msg = sub.next() => {
-
                 if let Some(msg) = maybe_msg {
-                    let event = Event::decode(msg.payload.as_ref())?;
-                    if should_archive(&event, &args){
-                        let event_bytes = write_event(&mut writer, &event, &mut hasher)?;
-                        bytes_written += event_bytes as u64;
-                        event_count += 1;
-                        file_events += 1;
-
-                        if first_timestamp == 0 {
-                            first_timestamp = event.timestamp;
+                    let event = match Event::decode(msg.payload.as_ref()) {
+                        Ok(event) => event,
+                        Err(e) => {
+                            log::warn!("failed to decode event: {}, skipping", e);
+                            continue;
                         }
-                        last_timestamp = event.timestamp;
-                        event_types.insert(event_type_name(&event));
+                    };
+                    if should_archive(&event, &args){
+                        current_file.write_event(&event)?;
 
-                        if bytes_written >= args.max_file_size {
-                            writer.flush()?;
-                            log::info!("file rotation: {} reached {:.2} MB", file_path.display(), bytes_written as f64 / 1_048_576.0);
-                            let checksum = format!("{:x}", hasher.finalize());
-                            let mut sorted_types: Vec<String> = event_types.drain().collect();
-                            sorted_types.sort();
-                            if let Some(handle) = compression_handle.take() {
-                                let (prev_compressed, prev_index) = handle.await.unwrap()?;
-                                manifest_files[prev_index].compressed_size = prev_compressed;
-                            }
-
-                            let ext = if args.compression_level > 0 { "bin.zst" } else { "bin" };
-                            manifest_files.push(FileEntry {
-                                name: format!("{}.{}.{}", args.base_name, file_index, ext),
-                                size_bytes: bytes_written,
-                                events: file_events,
-                                first_timestamp,
-                                last_timestamp,
-                                event_types: sorted_types,
-                                checksum,
-                                compressed_size: 0,
-                            });
-
-                            write_manifest(
-                                &args.output_dir,
-                                &args.base_name,
-                                &args.nats.address,
-                                created_at,
-                                event_count,
-                                &manifest_files,
-                            )?;
-
-                            if args.compression_level > 0 {
-                                let old_path = file_path.clone();
-                                let old_bytes = bytes_written;
-                                let current_index = manifest_files.len() - 1;
-                                let level = args.compression_level;
-                                compression_handle = Some(shared::tokio::task::spawn_blocking(move || {
-                                    let compressed_size = compress_archive_file(&old_path, level)?;
-                                    log::info!("compressed {:.2} MB -> {:.2} MB (ratio: {:.1}x)",
-                                        old_bytes as f64 / 1_048_576.0,
-                                        compressed_size as f64 / 1_048_576.0,
-                                        old_bytes as f64 / compressed_size as f64);
-                                    Ok((compressed_size, current_index))
-                                }));
-                            } else {
-                                log::info!("wrote {:.2} MB (no compression)", bytes_written as f64 / 1_048_576.0);
-                            }
-
-                            file_index += 1;
-                            bytes_written = 16;
-                            file_events = 0;
-                            first_timestamp = 0;
-                            last_timestamp = 0;
-                            let (new_path, new_writer, new_hasher) = create_archive_file(&args.output_dir, &args.base_name, file_index)?;
-                            file_path = new_path;
-                            writer = new_writer;
-                            hasher = new_hasher;
-                            log::info!("Created archive file: {}", file_path.display());
+                        if current_file.needs_rotation(args.max_file_size) {
+                            current_file = rotate(current_file, &mut session, &args)?;
                         }
                     }
                 } else {
@@ -302,102 +379,87 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         }
     }
 
-    if let Some(handle) = compression_handle.take() {
-        let (prev_compressed, prev_index) = handle.await.unwrap()?;
-        manifest_files[prev_index].compressed_size = prev_compressed;
-    }
-
-    writer.flush()?;
-    let checksum = format!("{:x}", hasher.finalize());
-    let mut sorted_types: Vec<String> = event_types.drain().collect();
-    sorted_types.sort();
-
-    let (last_compressed, ext) = if args.compression_level > 0 {
-        let compressed = compress_archive_file(&file_path, args.compression_level)?;
-        log::info!(
-            "compressed {:.2} MB -> {:.2} MB (ratio: {:.1}x)",
-            bytes_written as f64 / 1_048_576.0,
-            compressed as f64 / 1_048_576.0,
-            bytes_written as f64 / compressed as f64
-        );
-        (compressed, "bin.zst")
-    } else {
-        log::info!(
-            "wrote {:.2} MB (no compression)",
-            bytes_written as f64 / 1_048_576.0
-        );
-        (0, "bin")
-    };
-
-    manifest_files.push(FileEntry {
-        name: format!("{}.{}.{}", args.base_name, file_index, ext),
-        size_bytes: bytes_written,
-        events: file_events,
-        first_timestamp,
-        last_timestamp,
-        event_types: sorted_types,
-        checksum,
-        compressed_size: last_compressed,
-    });
-
-    write_manifest(
-        &args.output_dir,
-        &args.base_name,
-        &args.nats.address,
-        created_at,
-        event_count,
-        &manifest_files,
-    )?;
+    let total_files = session.file_index + 1;
+    close_file(current_file, &mut session, &args)?;
+    let total_events: u64 = session.manifest_files.iter().map(|f| f.events).sum();
 
     log::info!(
         "shutting down. total events archived: {}, files: {}",
-        event_count,
-        file_index + 1
+        total_events,
+        total_files
     );
     Ok(())
+}
+
+/// Finalizes the current archive file, adds its FileEntry to the manifest,
+/// and writes the manifest to disk.
+fn close_file(
+    current_file: ArchiveFile,
+    session: &mut SessionState,
+    args: &Args,
+) -> std::io::Result<()> {
+    let ext = if args.compression_level > 0 {
+        "bin.zst"
+    } else {
+        "bin"
+    };
+    let name = format!("{}.{}.{}", args.base_name, session.file_index, ext);
+    let (_path, entry) = current_file.finalize(name)?;
+    session.manifest_files.push(entry);
+
+    write_manifest(session, args)
+}
+
+/// Closes the current archive file and opens the next one.
+fn rotate(
+    current_file: ArchiveFile,
+    session: &mut SessionState,
+    args: &Args,
+) -> std::io::Result<ArchiveFile> {
+    close_file(current_file, session, args)?;
+    session.file_index += 1;
+    ArchiveFile::new(
+        &args.output_dir,
+        &args.base_name,
+        session.file_index,
+        args.compression_level,
+    )
 }
 
 fn should_archive(event: &Event, args: &Args) -> bool {
     if args.show_all() {
         return true;
     }
-    match event.peer_observer_event.as_ref().unwrap() {
-        PeerObserverEvent::EbpfExtractor(ebpf) => match ebpf.ebpf_event.as_ref().unwrap() {
-            ebpf::EbpfEvent::Message(_) => args.messages,
-            ebpf::EbpfEvent::Connection(_) => args.connections,
-            ebpf::EbpfEvent::Addrman(_) => args.addrman,
-            ebpf::EbpfEvent::Mempool(_) => args.mempool,
-            ebpf::EbpfEvent::Validation(_) => args.validation,
-        },
-        PeerObserverEvent::RpcExtractor(_) => args.rpc,
-        PeerObserverEvent::P2pExtractor(_) => args.p2p_extractor,
-        PeerObserverEvent::LogExtractor(_) => args.log_extractor,
+    match event_type_name(event) {
+        Some("messages") => args.messages,
+        Some("connections") => args.connections,
+        Some("addrman") => args.addrman,
+        Some("mempool") => args.mempool,
+        Some("validation") => args.validation,
+        Some("rpc") => args.rpc,
+        Some("p2p_extractor") => args.p2p_extractor,
+        Some("log_extractor") => args.log_extractor,
+        _ => false,
     }
 }
 
-fn event_type_name(event: &Event) -> String {
-    match event.peer_observer_event.as_ref().unwrap() {
-        PeerObserverEvent::EbpfExtractor(e) => match e.ebpf_event.as_ref().unwrap() {
-            ebpf::EbpfEvent::Message(_) => "messages".to_string(),
-            ebpf::EbpfEvent::Connection(_) => "connections".to_string(),
-            ebpf::EbpfEvent::Addrman(_) => "addrman".to_string(),
-            ebpf::EbpfEvent::Mempool(_) => "mempool".to_string(),
-            ebpf::EbpfEvent::Validation(_) => "validation".to_string(),
+fn event_type_name(event: &Event) -> Option<&'static str> {
+    let name = match event.peer_observer_event.as_ref()? {
+        PeerObserverEvent::EbpfExtractor(e) => match e.ebpf_event.as_ref()? {
+            ebpf::EbpfEvent::Message(_) => "messages",
+            ebpf::EbpfEvent::Connection(_) => "connections",
+            ebpf::EbpfEvent::Addrman(_) => "addrman",
+            ebpf::EbpfEvent::Mempool(_) => "mempool",
+            ebpf::EbpfEvent::Validation(_) => "validation",
         },
-        PeerObserverEvent::RpcExtractor(_) => "rpc".to_string(),
-        PeerObserverEvent::P2pExtractor(_) => "p2p_extractor".to_string(),
-        PeerObserverEvent::LogExtractor(_) => "log_extractor".to_string(),
-    }
+        PeerObserverEvent::RpcExtractor(_) => "rpc",
+        PeerObserverEvent::P2pExtractor(_) => "p2p_extractor",
+        PeerObserverEvent::LogExtractor(_) => "log_extractor",
+    };
+    Some(name)
 }
 
-fn write_manifest(
-    output_dir: &PathBuf,
-    base_name: &str,
-    nats_address: &str,
-    created_at: u64,
-    event_count: u64,
-    files: &[FileEntry],
-) -> std::io::Result<()> {
+fn write_manifest(session: &SessionState, args: &Args) -> std::io::Result<()> {
     let finished_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -405,64 +467,19 @@ fn write_manifest(
     let manifest = Manifest {
         session: Session {
             version: VERSION,
-            nats_address: nats_address.to_string(),
-            created_at,
+            nats_address: args.nats.address.clone(),
+            created_at: session.created_at,
             finished_at,
-            total_events: event_count,
-            total_files: files.len() as u32,
+            total_events: session.manifest_files.iter().map(|file| file.events).sum(),
+            total_files: session.manifest_files.len() as u32,
         },
-        files,
+        files: &session.manifest_files,
     };
-    let manifest_path = output_dir.join(format!("{}.manifest.toml", base_name));
-    let toml_str = toml::to_string_pretty(&manifest)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let manifest_path = args
+        .output_dir
+        .join(format!("{}.manifest.toml", args.base_name));
+    let toml_str = toml::to_string_pretty(&manifest).map_err(std::io::Error::other)?;
     fs::write(&manifest_path, &toml_str)?;
     log::info!("wrote manifest: {}", manifest_path.display());
     Ok(())
-}
-
-fn write_event(
-    writer: &mut BufWriter<File>,
-    event: &Event,
-    hasher: &mut Sha256,
-) -> std::io::Result<usize> {
-    let buf = event.encode_length_delimited_to_vec();
-    writer.write_all(&buf)?;
-    hasher.update(&buf);
-    Ok(buf.len())
-}
-
-// header: 16 bytes = MAGIC "PA" (2B) + VERSION (1B) + GIT_HASH (3B) + reserved (10B)
-fn write_header(writer: &mut BufWriter<File>, hasher: &mut Sha256) -> std::io::Result<()> {
-    let header = ArchiveHeader::new(GIT_HASH);
-    let bytes = header.to_bytes();
-    writer.write_all(&bytes)?;
-    hasher.update(&bytes);
-    writer.flush()?;
-    Ok(())
-}
-
-fn create_archive_file(
-    output_dir: &PathBuf,
-    base_name: &str,
-    index: u32,
-) -> std::io::Result<(PathBuf, BufWriter<File>, Sha256)> {
-    let file_path = output_dir.join(format!("{}.{}.bin", base_name, index));
-    let file = File::create(&file_path)?;
-    let mut writer = BufWriter::new(file);
-    let mut hasher = Sha256::new();
-    write_header(&mut writer, &mut hasher)?;
-    Ok((file_path, writer, hasher))
-}
-
-fn compress_archive_file(path: &PathBuf, level: i32) -> std::io::Result<u64> {
-    let compressed_path = path.with_extension("bin.zst");
-    let input = File::open(path)?;
-    let output = File::create(&compressed_path)?;
-    let mut encoder = zstd::Encoder::new(output, level)?;
-    std::io::copy(&mut BufReader::new(input), &mut encoder)?;
-    encoder.finish()?;
-    let compressed_size = fs::metadata(&compressed_path)?.len();
-    fs::remove_file(path)?;
-    Ok(compressed_size)
 }

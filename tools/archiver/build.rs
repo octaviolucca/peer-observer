@@ -12,14 +12,15 @@ fn main() {
     let b0 = u8::from_str_radix(&hash[0..2], 16).unwrap();
     let b1 = u8::from_str_radix(&hash[2..4], 16).unwrap();
     let b2 = u8::from_str_radix(&hash[4..6], 16).unwrap();
+    let b3 = u8::from_str_radix(&hash[6..8], 16).unwrap();
 
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let path = std::path::Path::new(&out_dir).join("git_hash.rs");
     std::fs::write(
         path,
         format!(
-            "const GIT_HASH: [u8; 3] = [0x{:02x}, 0x{:02x}, 0x{:02x}];\n",
-            b0, b1, b2
+            "const GIT_HASH: [u8; 4] = [0x{:02x}, 0x{:02x}, 0x{:02x}, 0x{:02x}];\n",
+            b0, b1, b2, b3
         ),
     )
     .unwrap();

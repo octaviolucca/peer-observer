@@ -30,9 +30,10 @@ checksum, event types, first/last timestamps).
 
 ## Compression
 
-Completed files are compressed with zstd after rotation, in a background task that does not block
-event ingestion. The default compression level is 22 (ultra). Use `--compression-level 3` for
-faster compression (~5x ratio) or `--compression-level 0` to skip compression.
+Archive files are compressed with zstd using streaming compression — the writer is wrapped in a
+`zstd::Encoder`, so files are written as `.bin.zst` directly. The default compression level is
+22 (ultra). Use `--compression-level 3` for faster compression (~5x ratio)
+or `--compression-level 0` to skip compression.
 
 ## Example
 
@@ -97,7 +98,7 @@ Options:
       --log-extractor
           If passed, archive log-extractor events
       --compression-level <COMPRESSION_LEVEL>
-          Zstd compression level (0 = no compression, 3 = default, 22 = ultra) [default: 22]
+          Zstd compression level (1-22, 0 = zstd default). Default: 22 (ultra) [default: 22]
   -h, --help
           Print help
   -V, --version
