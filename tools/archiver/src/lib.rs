@@ -113,11 +113,10 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     log::info!("Connected to NATS-server at {}", args.nats.address);
 
     fs::create_dir_all(&args.output_dir)?;
-    let file_path = args.output_dir.join(format!("{}.0.bin", args.base_name));
-    let file = File::create(&file_path)?;
-    let mut writer = BufWriter::new(file);
-
-    write_header(&mut writer)?;
+    let mut file_index: u32 = 0;
+    let mut bytes_written: u64 = 16; // header
+    let (mut file_path, mut writer) =
+        create_archive_file(&args.output_dir, &args.base_name, file_index)?;
     log::info!("Created archive file: {}", file_path.display());
 
     let mut event_count: u64 = 0;
@@ -128,11 +127,21 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
                 if let Some(msg) = maybe_msg {
                     let event = Event::decode(msg.payload.as_ref())?;
                     if should_archive(&event, &args){
-                        write_event(&mut writer, &event)?;
+                        let event_bytes = write_event(&mut writer, &event)?;
+                        bytes_written += event_bytes as u64;
                         event_count += 1;
                         if event_count % 1000 == 0 {
-                            let size = file_path.metadata().map(|m| m.len()).unwrap_or(0);
-                            log::info!("archived {} events ({:.2} MB)", event_count, size as f64 / 1_048_576.0);
+                            log::info!("archived {} events ({:.2} MB)", event_count, bytes_written as f64 / 1_048_576.0);
+                        }
+                        if bytes_written >= args.max_file_size {
+                            writer.flush()?;
+                            log::info!("file rotation: {} reached {:.2} MB", file_path.display(), bytes_written as f64 / 1_048_576.0);
+                            file_index += 1;
+                            bytes_written = 16;
+                            let (new_path, new_writer) = create_archive_file(&args.output_dir, &args.base_name, file_index)?;
+                            file_path = new_path;
+                            writer = new_writer;
+                            log::info!("Created archive file: {}", file_path.display());
                         }
                     }
                 } else {
@@ -183,10 +192,10 @@ fn should_archive(event: &Event, args: &Args) -> bool {
     }
 }
 
-fn write_event(writer: &mut BufWriter<File>, event: &Event) -> std::io::Result<()> {
+fn write_event(writer: &mut BufWriter<File>, event: &Event) -> std::io::Result<usize> {
     let buf = event.encode_length_delimited_to_vec();
     writer.write_all(&buf)?;
-    Ok(())
+    Ok(buf.len())
 }
 
 fn write_header(writer: &mut BufWriter<File>) -> std::io::Result<()> {
@@ -195,4 +204,16 @@ fn write_header(writer: &mut BufWriter<File>) -> std::io::Result<()> {
     writer.write_all(&[0u8; 7])?; // 7 bytes: reserved
     writer.flush()?;
     Ok(())
+}
+
+fn create_archive_file(
+    output_dir: &PathBuf,
+    base_name: &str,
+    index: u32,
+) -> std::io::Result<(PathBuf, BufWriter<File>)> {
+    let file_path = output_dir.join(format!("{}.{}.bin", base_name, index));
+    let file = File::create(&file_path)?;
+    let mut writer = BufWriter::new(file);
+    write_header(&mut writer)?;
+    Ok((file_path, writer))
 }

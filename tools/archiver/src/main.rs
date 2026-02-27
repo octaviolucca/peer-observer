@@ -12,18 +12,24 @@ async fn main() {
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let archiver_handle = tokio::spawn(archiver::run(args, shutdown_rx));
+    let mut archiver_handle = tokio::spawn(archiver::run(args, shutdown_rx));
 
     tokio::select! {
         _ = signal::ctrl_c() => {
             log::info!("Received Ctrl+C. Stopping...");
             let _ = shutdown_tx.send(true);
         }
-        result = archiver_handle => {
+        result = &mut archiver_handle => {
             match result.unwrap() {
                 Ok(_) => log::info!("archiver task completed."),
                 Err(e) => log::error!("archiver task failed: {e}"),
             }
+            return;
         }
+    }
+
+    match archiver_handle.await.unwrap() {
+        Ok(_) => log::info!("archiver task completed."),
+        Err(e) => log::error!("archiver task failed: {e}"),
     }
 }
