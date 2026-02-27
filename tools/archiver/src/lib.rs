@@ -12,15 +12,18 @@ use shared::protobuf::ebpf_extractor::ebpf;
 use shared::protobuf::event::event::PeerObserverEvent;
 use shared::protobuf::event::Event;
 use shared::tokio::sync::watch;
+use shared::tokio::task::JoinHandle;
 use std::path::PathBuf;
 
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+
+type CompressionResult = std::io::Result<(u64, usize)>;
 
 const MAGIC: &[u8; 8] = b"POBS_ARC";
 const VERSION: u8 = 1;
@@ -50,6 +53,7 @@ struct FileEntry {
     last_timestamp: u64,
     event_types: Vec<String>,
     checksum: String,
+    compressed_size: u64,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -106,6 +110,10 @@ pub struct Args {
     /// If passed, archive log-extractor events.
     #[arg(long)]
     pub log_extractor: bool,
+
+    /// Zstd compression level (0 = no compression, 3 = default, 22 = ultra).
+    #[arg(long, default_value_t = 22)]
+    pub compression_level: i32,
 }
 
 impl Args {
@@ -162,6 +170,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     let mut last_timestamp: u64 = 0;
     let mut event_types: HashSet<String> = HashSet::new();
     let mut manifest_files: Vec<FileEntry> = Vec::new();
+    let mut compression_handle: Option<JoinHandle<CompressionResult>> = None;
 
     loop {
         shared::tokio::select! {
@@ -187,15 +196,21 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
                             let checksum = format!("{:x}", hasher.finalize());
                             let mut sorted_types: Vec<String> = event_types.drain().collect();
                             sorted_types.sort();
+                            if let Some(handle) = compression_handle.take() {
+                                let (prev_compressed, prev_index) = handle.await.unwrap()?;
+                                manifest_files[prev_index].compressed_size = prev_compressed;
+                            }
 
+                            let ext = if args.compression_level > 0 { "bin.zst" } else { "bin" };
                             manifest_files.push(FileEntry {
-                                name: format!("{}.{}.bin", args.base_name, file_index),
+                                name: format!("{}.{}.{}", args.base_name, file_index, ext),
                                 size_bytes: bytes_written,
                                 events: file_events,
                                 first_timestamp,
                                 last_timestamp,
                                 event_types: sorted_types,
                                 checksum,
+                                compressed_size: 0,
                             });
 
                             write_manifest(
@@ -206,6 +221,23 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
                                 event_count,
                                 &manifest_files,
                             )?;
+
+                            if args.compression_level > 0 {
+                                let old_path = file_path.clone();
+                                let old_bytes = bytes_written;
+                                let current_index = manifest_files.len() - 1;
+                                let level = args.compression_level;
+                                compression_handle = Some(shared::tokio::task::spawn_blocking(move || {
+                                    let compressed_size = compress_archive_file(&old_path, level)?;
+                                    log::info!("compressed {:.2} MB -> {:.2} MB (ratio: {:.1}x)",
+                                        old_bytes as f64 / 1_048_576.0,
+                                        compressed_size as f64 / 1_048_576.0,
+                                        old_bytes as f64 / compressed_size as f64);
+                                    Ok((compressed_size, current_index))
+                                }));
+                            } else {
+                                log::info!("wrote {:.2} MB (no compression)", bytes_written as f64 / 1_048_576.0);
+                            }
 
                             file_index += 1;
                             bytes_written = 16;
@@ -241,19 +273,42 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         }
     }
 
+    if let Some(handle) = compression_handle.take() {
+        let (prev_compressed, prev_index) = handle.await.unwrap()?;
+        manifest_files[prev_index].compressed_size = prev_compressed;
+    }
+
     writer.flush()?;
     let checksum = format!("{:x}", hasher.finalize());
     let mut sorted_types: Vec<String> = event_types.drain().collect();
     sorted_types.sort();
 
+    let (last_compressed, ext) = if args.compression_level > 0 {
+        let compressed = compress_archive_file(&file_path, args.compression_level)?;
+        log::info!(
+            "compressed {:.2} MB -> {:.2} MB (ratio: {:.1}x)",
+            bytes_written as f64 / 1_048_576.0,
+            compressed as f64 / 1_048_576.0,
+            bytes_written as f64 / compressed as f64
+        );
+        (compressed, "bin.zst")
+    } else {
+        log::info!(
+            "wrote {:.2} MB (no compression)",
+            bytes_written as f64 / 1_048_576.0
+        );
+        (0, "bin")
+    };
+
     manifest_files.push(FileEntry {
-        name: format!("{}.{}.bin", args.base_name, file_index),
+        name: format!("{}.{}.{}", args.base_name, file_index, ext),
         size_bytes: bytes_written,
         events: file_events,
         first_timestamp,
         last_timestamp,
         event_types: sorted_types,
         checksum,
+        compressed_size: last_compressed,
     });
 
     write_manifest(
@@ -370,4 +425,16 @@ fn create_archive_file(
     let mut hasher = Sha256::new();
     write_header(&mut writer, &mut hasher)?;
     Ok((file_path, writer, hasher))
+}
+
+fn compress_archive_file(path: &PathBuf, level: i32) -> std::io::Result<u64> {
+    let compressed_path = path.with_extension("bin.zst");
+    let input = File::open(path)?;
+    let output = File::create(&compressed_path)?;
+    let mut encoder = zstd::Encoder::new(output, level)?;
+    std::io::copy(&mut BufReader::new(input), &mut encoder)?;
+    encoder.finish()?;
+    let compressed_size = fs::metadata(&compressed_path)?.len();
+    fs::remove_file(path)?;
+    Ok(compressed_size)
 }
