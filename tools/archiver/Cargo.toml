@@ -1,0 +1,11 @@
+[package]
+name = "archiver"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shared = { path = "../../shared" }
+
+[features]
+strict = []
+nats_integration_tests = []

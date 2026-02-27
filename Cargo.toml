@@ -11,4 +11,5 @@ members = [
   "tools/websocket",
   "tools/metrics",
   "tools/connectivity-check",
+  "tools/archiver",
 ]
