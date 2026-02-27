@@ -25,8 +25,37 @@ use sha2::{Digest, Sha256};
 
 type CompressionResult = std::io::Result<(u64, usize)>;
 
-const MAGIC: &[u8; 8] = b"POBS_ARC";
+const MAGIC: [u8; 2] = *b"PA";
 const VERSION: u8 = 1;
+const HEADER_SIZE: usize = 16;
+include!(concat!(env!("OUT_DIR"), "/git_hash.rs"));
+
+struct ArchiveHeader {
+    magic: [u8; 2],
+    version: u8,
+    git_hash: [u8; 3],
+    reserved: [u8; 10],
+}
+
+impl ArchiveHeader {
+    fn new(git_hash: [u8; 3]) -> Self {
+        Self {
+            magic: MAGIC,
+            version: VERSION,
+            git_hash,
+            reserved: [0u8; 10],
+        }
+    }
+
+    fn to_bytes(&self) -> [u8; HEADER_SIZE] {
+        let mut buf = [0u8; HEADER_SIZE];
+        buf[0..2].copy_from_slice(&self.magic);
+        buf[2] = self.version;
+        buf[3..6].copy_from_slice(&self.git_hash);
+        buf[6..16].copy_from_slice(&self.reserved);
+        buf
+    }
+}
 
 #[derive(Serialize)]
 struct Manifest<'a> {
@@ -403,13 +432,12 @@ fn write_event(
     Ok(buf.len())
 }
 
-// header: 16 bytes = MAGIC (8B) + VERSION (1B) + reserved (7B)
+// header: 16 bytes = MAGIC "PA" (2B) + VERSION (1B) + GIT_HASH (3B) + reserved (10B)
 fn write_header(writer: &mut BufWriter<File>, hasher: &mut Sha256) -> std::io::Result<()> {
-    let mut header = [0u8; 16];
-    header[..8].copy_from_slice(MAGIC);
-    header[8] = VERSION;
-    writer.write_all(&header)?;
-    hasher.update(&header);
+    let header = ArchiveHeader::new(GIT_HASH);
+    let bytes = header.to_bytes();
+    writer.write_all(&bytes)?;
+    hasher.update(&bytes);
     writer.flush()?;
     Ok(())
 }
