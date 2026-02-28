@@ -13,6 +13,7 @@ zstd = "0.13"
 [dev-dependencies]
 sha2 = "0.10"
 toml = "0.8"
+replayer = { path = "../replayer" }
 
 [features]
 # Treat warnings as a build error.

@@ -1,0 +1,59 @@
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+
+use shared::prost::Message;
+use shared::protobuf::event::Event;
+
+const HEADER_SIZE: usize = 16;
+
+pub struct ArchiveHeader {
+    pub version: u8,
+    pub git_hash: [u8; 4],
+}
+
+pub struct Archive {
+    pub header: ArchiveHeader,
+    pub events: Vec<Event>,
+}
+
+pub fn read_archive(path: &Path) -> std::io::Result<Archive> {
+    let file = File::open(path)?;
+    let mut buf = Vec::new();
+    zstd::Decoder::new(file)?.read_to_end(&mut buf)?;
+
+    if buf.len() < HEADER_SIZE {
+        return Err(std::io::Error::other(format!(
+            "file too small: {} bytes",
+            buf.len()
+        )));
+    }
+
+    if &buf[0..2] != b"PA" {
+        return Err(std::io::Error::other(format!(
+            "invalid magic: {:02x}{:02x} (expected \"PA\")",
+            buf[0], buf[1]
+        )));
+    }
+
+    let header = ArchiveHeader {
+        version: buf[2],
+        git_hash: [buf[3], buf[4], buf[5], buf[6]],
+    };
+
+    let data = &buf[HEADER_SIZE..];
+    let mut cursor = 0;
+    let mut events = Vec::new();
+
+    while cursor < data.len() {
+        let event = Event::decode_length_delimited(&data[cursor..]).map_err(|e| {
+            std::io::Error::other(format!("decode error at byte {}: {}", cursor, e))
+        })?;
+        let size = event.encoded_len();
+        let varint_len = shared::prost::length_delimiter_len(size);
+        cursor += varint_len + size;
+        events.push(event);
+    }
+
+    Ok(Archive { header, events })
+}
