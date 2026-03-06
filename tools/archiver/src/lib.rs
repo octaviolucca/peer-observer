@@ -79,6 +79,10 @@ struct FileEntry {
     last_timestamp: u64,
     event_types: Vec<String>,
     checksum: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compressed_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compressed_checksum: Option<String>,
 }
 
 /// Holds session-level state that persists across file rotations.
@@ -101,30 +105,73 @@ impl SessionState {
     }
 }
 
+struct TrackingWriter {
+    inner: BufWriter<File>,
+    hasher: Sha256,
+    bytes_written: u64,
+}
+
+impl Write for TrackingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.hasher.update(&buf[..written]);
+        self.bytes_written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct CompressedStats {
+    checksum: String,
+    size_bytes: u64,
+}
+
 enum ArchiveWriter {
     Plain(BufWriter<File>),
-    Zstd(zstd::Encoder<'static, BufWriter<File>>),
+    Zstd(zstd::Encoder<'static, TrackingWriter>),
 }
 
 impl ArchiveWriter {
     fn new(file: File, compression_level: i32) -> std::io::Result<Self> {
+        if compression_level < 0 {
+            return Err(std::io::Error::other("compression_level must be >= 0"));
+        }
         if compression_level > 0 {
-            Ok(Self::Zstd(zstd::Encoder::new(
-                BufWriter::new(file),
-                compression_level,
-            )?))
+            let tracker = TrackingWriter {
+                inner: BufWriter::new(file),
+                hasher: Sha256::new(),
+                bytes_written: 0,
+            };
+            let encoder = zstd::Encoder::new(tracker, compression_level)?;
+            Ok(Self::Zstd(encoder))
         } else {
             Ok(Self::Plain(BufWriter::new(file)))
         }
     }
 
-    fn finish(self) -> std::io::Result<()> {
+    fn compressed_bytes(&self) -> Option<u64> {
         match self {
-            Self::Plain(mut writer) => writer.flush(),
+            Self::Plain(_) => None,
+            Self::Zstd(encoder) => Some(encoder.get_ref().bytes_written),
+        }
+    }
+
+    fn finish(self) -> std::io::Result<Option<CompressedStats>> {
+        match self {
+            Self::Plain(mut writer) => {
+                writer.flush()?;
+                Ok(None)
+            }
             Self::Zstd(encoder) => {
-                let mut inner = encoder.finish()?;
-                inner.flush()?;
-                Ok(())
+                let mut tracker = encoder.finish()?;
+                tracker.flush()?;
+                Ok(Some(CompressedStats {
+                    size_bytes: tracker.bytes_written,
+                    checksum: format!("{:x}", tracker.hasher.finalize()),
+                }))
             }
         }
     }
@@ -211,11 +258,14 @@ impl ArchiveFile {
     }
 
     fn needs_rotation(&self, max_file_size: u64) -> bool {
-        self.bytes_written >= max_file_size
+        match self.writer.compressed_bytes() {
+            Some(size) => size >= max_file_size,
+            None => self.bytes_written >= max_file_size,
+        }
     }
 
     fn finalize(self, name: String) -> std::io::Result<(PathBuf, FileEntry)> {
-        self.writer.finish()?;
+        let compressed_stats = self.writer.finish()?;
         let checksum = format!("{:x}", self.hasher.finalize());
         let mut sorted_types: Vec<String> =
             self.event_types.into_iter().map(String::from).collect();
@@ -228,6 +278,8 @@ impl ArchiveFile {
             last_timestamp: self.last_timestamp,
             event_types: sorted_types,
             checksum,
+            compressed_size_bytes: compressed_stats.as_ref().map(|s| s.size_bytes),
+            compressed_checksum: compressed_stats.map(|s| s.checksum),
         };
         Ok((self.path, entry))
     }
@@ -248,7 +300,7 @@ pub struct Args {
     #[arg(short, long, default_value = "archive")]
     pub base_name: String,
 
-    /// Maximum uncompressed file size in bytes before rotation (default: 1GB).
+    /// Maximum compressed output size in bytes before rotation (default: 1GB).
     #[arg(long, default_value_t = 1_073_741_824)]
     pub max_file_size: u64,
 

@@ -304,10 +304,10 @@ async fn test_filter_log_extractor() {
 }
 
 #[tokio::test]
-async fn test_file_rotation() {
+async fn test_file_rotation_with_compression() {
     setup();
 
-    let tmp_dir = std::env::temp_dir().join("archiver_test_rotation");
+    let tmp_dir = std::env::temp_dir().join("archiver_test_rotation_with_compression");
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
     let nats_server = NatsServerForTesting::new(&[]).await;
@@ -317,7 +317,8 @@ async fn test_file_rotation() {
     let dir = tmp_dir.clone();
     let archiver_handle = tokio::spawn(async move {
         let mut args = make_test_args(nats_server.port, &dir);
-        args.max_file_size = 100; // force rotation after ~1-2 events
+        args.max_file_size = 1; // force rotation on every event
+        args.compression_level = 1;
         archiver::run(args, shutdown_rx).await.unwrap();
     });
 
@@ -485,6 +486,22 @@ async fn test_compression_integrity() {
             "decompressed SHA-256 of {} must match manifest checksum",
             zst_name
         );
+
+        let compressed_checksum = entry["compressed_checksum"].as_str().unwrap();
+        let compressed_size = entry["compressed_size_bytes"].as_integer().unwrap() as u64;
+
+        let raw_zst = std::fs::read(&zst_path).unwrap();
+        let actual_compressed_checksum = format!("{:x}", sha2::Sha256::digest(&raw_zst));
+        assert_eq!(
+            actual_compressed_checksum, compressed_checksum,
+            "SHA-256 of raw .zst must match manifest compressed_checksum"
+        );
+
+        let file_size = std::fs::metadata(&zst_path).unwrap().len();
+        assert_eq!(
+            compressed_size, file_size,
+            "compressed_size_bytes must match file size on disk"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -540,6 +557,15 @@ async fn test_no_compression() {
     assert_eq!(
         actual_checksum, expected_checksum,
         "SHA-256 of raw .bin must match manifest checksum"
+    );
+
+    assert!(
+        files[0].get("compressed_checksum").is_none(),
+        "compressed_checksum should not be present without compression"
+    );
+    assert!(
+        files[0].get("compressed_size_bytes").is_none(),
+        "compressed_size_bytes should not be present without compression"
     );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
