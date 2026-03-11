@@ -425,6 +425,55 @@ async fn test_replayer_roundtrip() {
 }
 
 #[tokio::test]
+async fn test_replayer_roundtrip_uncompressed() {
+    setup();
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "archiver_test_replayer_roundtrip_uncompressed_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    let nats_server = NatsServerForTesting::new(&[]).await;
+    let nats_publisher = NatsPublisherForTesting::new(nats_server.port).await;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let dir = tmp_dir.clone();
+    let archiver_handle = tokio::spawn(async move {
+        let mut args = make_test_args(nats_server.port, &dir);
+        args.compression_level = 0;
+        archiver::run(args, shutdown_rx).await.unwrap();
+    });
+
+    sleep(Duration::from_secs(1)).await;
+
+    let all_events = make_all_event_types();
+    for (event, _) in &all_events {
+        nats_publisher
+            .publish(Subject::NetMsg.to_string(), event.encode_to_vec())
+            .await;
+    }
+
+    sleep(Duration::from_millis(500)).await;
+    shutdown_tx.send(true).unwrap();
+    archiver_handle.await.unwrap();
+
+    let archive_path = tmp_dir.join("test.0.bin");
+    assert!(archive_path.exists());
+
+    let archive = replayer::read_archive(&archive_path).unwrap();
+
+    assert_eq!(archive.header.version, 1);
+    assert_eq!(archive.events.len(), all_events.len());
+
+    for ((sent, _label), decoded) in all_events.iter().zip(archive.events.iter()) {
+        assert_eq!(sent.peer_observer_event, decoded.peer_observer_event);
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[tokio::test]
 async fn test_compression_integrity() {
     setup();
 

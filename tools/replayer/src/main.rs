@@ -5,9 +5,11 @@ use shared::protobuf::event::event::PeerObserverEvent;
 
 fn main() {
     let files: Vec<String> = env::args().skip(1).collect();
-    if files.is_empty() {
-        eprintln!("usage: replayer <file.bin.zst> [file2.bin.zst ...]");
-        std::process::exit(1);
+    if files.is_empty() || files.iter().any(|f| f == "--help" || f == "-h") {
+        println!("Read and display peer-observer archive files");
+        println!();
+        println!("Usage: replayer <file.bin[.zst]> [file2.bin[.zst] ...]");
+        return;
     }
 
     for path in &files {

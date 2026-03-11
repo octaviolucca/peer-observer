@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -18,9 +19,13 @@ pub struct Archive {
 }
 
 pub fn read_archive(path: &Path) -> std::io::Result<Archive> {
-    let file = File::open(path)?;
+    let mut file = File::open(path)?;
     let mut buf = Vec::new();
-    zstd::Decoder::new(file)?.read_to_end(&mut buf)?;
+    if path.extension() == Some(OsStr::new("zst")) {
+        zstd::Decoder::new(file)?.read_to_end(&mut buf)?;
+    } else {
+        file.read_to_end(&mut buf)?;
+    }
 
     if buf.len() < HEADER_SIZE {
         return Err(std::io::Error::other(format!(
