@@ -100,7 +100,7 @@ Options:
       --log-extractor
           If passed, archive log-extractor events
       --compression-level <COMPRESSION_LEVEL>
-          Zstd compression level (1-22, 0 = zstd default). Default: 22 (ultra) [default: 22]
+          Zstd compression level (0 = no compression, 1-22). Default: 22 (ultra) [default: 22]
   -h, --help
           Print help
   -V, --version

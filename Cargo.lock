@@ -93,7 +93,6 @@ name = "archiver"
 version = "0.1.0"
 dependencies = [
  "replayer",
- "serde",
  "sha2",
  "shared",
  "toml",

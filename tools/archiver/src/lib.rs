@@ -8,8 +8,8 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
 use sha2::{Digest, Sha256};
+use shared::serde::Serialize;
 
 use shared::clap;
 use shared::clap::Parser;
@@ -55,12 +55,14 @@ impl ArchiveHeader {
 }
 
 #[derive(Serialize)]
+#[serde(crate = "shared::serde")]
 struct Manifest<'a> {
     session: Session,
     files: &'a [FileEntry],
 }
 
 #[derive(Serialize)]
+#[serde(crate = "shared::serde")]
 struct Session {
     version: u8,
     nats_address: String,
@@ -71,6 +73,7 @@ struct Session {
 }
 
 #[derive(Serialize)]
+#[serde(crate = "shared::serde")]
 struct FileEntry {
     name: String,
     size_bytes: u64,
@@ -135,17 +138,14 @@ enum ArchiveWriter {
 }
 
 impl ArchiveWriter {
-    fn new(file: File, compression_level: i32) -> std::io::Result<Self> {
-        if compression_level < 0 {
-            return Err(std::io::Error::other("compression_level must be >= 0"));
-        }
+    fn new(file: File, compression_level: u32) -> std::io::Result<Self> {
         if compression_level > 0 {
             let tracker = TrackingWriter {
                 inner: BufWriter::new(file),
                 hasher: Sha256::new(),
                 bytes_written: 0,
             };
-            let encoder = zstd::Encoder::new(tracker, compression_level)?;
+            let encoder = zstd::Encoder::new(tracker, compression_level as i32)?;
             Ok(Self::Zstd(encoder))
         } else {
             Ok(Self::Plain(BufWriter::new(file)))
@@ -213,7 +213,7 @@ impl ArchiveFile {
         output_dir: &Path,
         base_name: &str,
         index: u32,
-        compression_level: i32,
+        compression_level: u32,
     ) -> std::io::Result<Self> {
         let ext = if compression_level > 0 {
             "bin.zst"
@@ -342,7 +342,7 @@ pub struct Args {
 
     /// Zstd compression level (0 = no compression, 1-22). Default: 22 (ultra).
     #[arg(long, default_value_t = 22)]
-    pub compression_level: i32,
+    pub compression_level: u32,
 }
 
 impl Args {
