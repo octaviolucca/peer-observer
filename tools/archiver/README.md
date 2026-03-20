@@ -23,11 +23,10 @@ to record the file, allowing future readers to check out that commit if needed.
 
 ## Manifest
 
-Each recording session produces a `<base-name>.manifest.toml` file alongside the archive files.
-The manifest is updated on every file rotation and on shutdown. It contains session metadata
-(timestamps, total events, NATS address) and per-file metadata (event count, uncompressed size,
-SHA-256 checksums, event types, first/last timestamps). When compression is enabled, each file
-entry also includes the compressed file size and checksum.
+Each recording session produces a `<base-name>.<timestamp>.manifest.toml` file alongside the
+archive files. The manifest is updated on every file rotation and on shutdown. It contains per-file
+metadata (version, NATS address, event count, uncompressed size, SHA-256 checksum, event types,
+first/last timestamps).
 
 ## Compression
 
@@ -78,7 +77,7 @@ Options:
   -o, --output-dir <OUTPUT_DIR>
           Output directory for archive files
   -b, --base-name <BASE_NAME>
-          Base name for archive files (e.g., "mainnet" -> "mainnet.0.bin") [default: archive]
+          Base name for archive files (e.g., "mainnet" -> "mainnet.<timestamp>.bin.zst") [default: archive]
       --max-file-size <MAX_FILE_SIZE>
           Maximum compressed output size in bytes before rotation (default: 1GB) [default: 1073741824]
   -l, --log-level <LOG_LEVEL>

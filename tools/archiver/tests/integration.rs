@@ -30,6 +30,15 @@ use std::{fs::File, io::Read, sync::Once, time::Duration};
 
 static INIT: Once = Once::new();
 
+fn find_files(dir: &std::path::Path, suffix: &str) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(suffix))
+        .map(|e| e.path())
+        .collect()
+}
+
 fn setup() {
     INIT.call_once(|| {
         simple_logger::SimpleLogger::new()
@@ -233,7 +242,11 @@ async fn run_filter_test(flag: &str, expected_count: usize) {
     shutdown_tx.send(true).unwrap();
     archiver_handle.await.unwrap();
 
-    let file = File::open(tmp_dir.join("test.0.bin.zst")).unwrap();
+    let archive_path = find_files(&tmp_dir, ".bin.zst")
+        .into_iter()
+        .next()
+        .expect("expected a .0.bin.zst file");
+    let file = File::open(archive_path).unwrap();
     let mut reader = zstd::Decoder::new(file).unwrap();
 
     let mut header = [0u8; 16];
@@ -412,7 +425,11 @@ async fn test_replayer_roundtrip() {
     shutdown_tx.send(true).unwrap();
     archiver_handle.await.unwrap();
 
-    let archive = replayer::read_archive(&tmp_dir.join("test.0.bin.zst")).unwrap();
+    let archive_path = find_files(&tmp_dir, ".bin.zst")
+        .into_iter()
+        .next()
+        .expect("expected a .0.bin.zst file");
+    let archive = replayer::read_archive(&archive_path).unwrap();
 
     assert_eq!(archive.header.version, 1);
     assert_eq!(archive.events.len(), all_events.len());
@@ -458,9 +475,10 @@ async fn test_replayer_roundtrip_uncompressed() {
     shutdown_tx.send(true).unwrap();
     archiver_handle.await.unwrap();
 
-    let archive_path = tmp_dir.join("test.0.bin");
-    assert!(archive_path.exists());
-
+    let archive_path = find_files(&tmp_dir, ".bin")
+        .into_iter()
+        .next()
+        .expect("expected a .0.bin file");
     let archive = replayer::read_archive(&archive_path).unwrap();
 
     assert_eq!(archive.header.version, 1);
@@ -505,7 +523,11 @@ async fn test_compression_integrity() {
     shutdown_tx.send(true).unwrap();
     archiver_handle.await.unwrap();
 
-    let manifest_str = std::fs::read_to_string(tmp_dir.join("test.manifest.toml")).unwrap();
+    let manifest_path = find_files(&tmp_dir, ".manifest.toml")
+        .into_iter()
+        .next()
+        .expect("expected a manifest file");
+    let manifest_str = std::fs::read_to_string(manifest_path).unwrap();
     let manifest: toml::Value = manifest_str.parse().unwrap();
     let files = manifest["files"].as_array().unwrap();
 
@@ -588,19 +610,23 @@ async fn test_no_compression() {
     archiver_handle.await.unwrap();
 
     // should be .bin, not .bin.zst
-    let bin_path = tmp_dir.join("test.0.bin");
-    let zst_path = tmp_dir.join("test.0.bin.zst");
-    assert!(bin_path.exists(), "test.0.bin should exist");
-    assert!(!zst_path.exists(), "test.0.bin.zst should not exist");
+    let bin_files = find_files(&tmp_dir, ".bin");
+    assert!(!bin_files.is_empty(), ".0.bin file should exist");
+    let zst_files = find_files(&tmp_dir, ".bin.zst");
+    assert!(zst_files.is_empty(), ".0.bin.zst file should not exist");
 
     // manifest should reference .bin
-    let manifest_str = std::fs::read_to_string(tmp_dir.join("test.manifest.toml")).unwrap();
+    let manifest_path = find_files(&tmp_dir, ".manifest.toml")
+        .into_iter()
+        .next()
+        .expect("expected a manifest file");
+    let manifest_str = std::fs::read_to_string(manifest_path).unwrap();
     let manifest: toml::Value = manifest_str.parse().unwrap();
     let files = manifest["files"].as_array().unwrap();
-    assert_eq!(files[0]["name"].as_str().unwrap(), "test.0.bin");
+    assert!(files[0]["name"].as_str().unwrap().ends_with(".bin"));
 
     // checksum should match raw file content
-    let raw = std::fs::read(&bin_path).unwrap();
+    let raw = std::fs::read(&bin_files[0]).unwrap();
     let actual_checksum = format!("{:x}", sha2::Sha256::digest(&raw));
     let expected_checksum = files[0]["checksum"].as_str().unwrap();
     assert_eq!(

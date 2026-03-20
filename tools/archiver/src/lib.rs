@@ -57,25 +57,15 @@ impl ArchiveHeader {
 #[derive(Serialize)]
 #[serde(crate = "shared::serde")]
 struct Manifest<'a> {
-    session: Session,
     files: &'a [FileEntry],
-}
-
-#[derive(Serialize)]
-#[serde(crate = "shared::serde")]
-struct Session {
-    version: u8,
-    nats_address: String,
-    created_at: u64,
-    finished_at: u64,
-    total_events: u64,
-    total_files: u32,
 }
 
 #[derive(Serialize)]
 #[serde(crate = "shared::serde")]
 struct FileEntry {
     name: String,
+    version: u8,
+    nats_address: String,
     size_bytes: u64,
     events: u64,
     first_timestamp: u64,
@@ -88,21 +78,19 @@ struct FileEntry {
     compressed_checksum: Option<String>,
 }
 
-/// Holds session-level state that persists across file rotations.
+/// Holds state that persists across file rotations.
 struct SessionState {
-    created_at: u64,
-    file_index: u32,
+    started_at_ms: u64,
     manifest_files: Vec<FileEntry>,
 }
 
 impl SessionState {
     fn new() -> Self {
         Self {
-            created_at: SystemTime::now()
+            started_at_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64,
-            file_index: 0,
             manifest_files: Vec::new(),
         }
     }
@@ -209,19 +197,36 @@ struct ArchiveFile {
 }
 
 impl ArchiveFile {
-    fn new(
-        output_dir: &Path,
-        base_name: &str,
-        index: u32,
-        compression_level: u32,
-    ) -> std::io::Result<Self> {
+    fn new(output_dir: &Path, base_name: &str, compression_level: u32) -> std::io::Result<Self> {
         let ext = if compression_level > 0 {
             "bin.zst"
         } else {
             "bin"
         };
-        let path = output_dir.join(format!("{}.{}.{}", base_name, index, ext));
-        let file = File::create(&path)?;
+        // Retry on rare timestamp collisions (e.g. fast rotations in tests)
+        let (path, file) = loop {
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let path = output_dir.join(format!("{}.{}.{}", base_name, ts, ext));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => break (path, file),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!("failed to create archive {}: {}", path.display(), e),
+                    ))
+                }
+            }
+        };
         let mut writer = ArchiveWriter::new(file, compression_level)?;
         let mut hasher = Sha256::new();
         // header: 16 bytes = MAGIC "PA" (2B) + VERSION (1B) + GIT_HASH (4B) + reserved (9B)
@@ -264,7 +269,7 @@ impl ArchiveFile {
         }
     }
 
-    fn finalize(self, name: String) -> std::io::Result<(PathBuf, FileEntry)> {
+    fn finalize(self, name: String, nats_address: &str) -> std::io::Result<(PathBuf, FileEntry)> {
         let compressed_stats = self.writer.finish()?;
         let checksum = format!("{:x}", self.hasher.finalize());
         let mut sorted_types: Vec<String> =
@@ -272,6 +277,8 @@ impl ArchiveFile {
         sorted_types.sort();
         let entry = FileEntry {
             name,
+            version: VERSION,
+            nats_address: nats_address.to_string(),
             size_bytes: self.bytes_written,
             events: self.events,
             first_timestamp: self.first_timestamp,
@@ -296,7 +303,7 @@ pub struct Args {
     #[arg(short, long)]
     pub output_dir: PathBuf,
 
-    /// Base name for archive files (e.g., "mainnet" -> "mainnet.0.bin").
+    /// Base name for archive files (e.g., "mainnet" -> "mainnet.<timestamp>.bin.zst").
     #[arg(short, long, default_value = "archive")]
     pub base_name: String,
 
@@ -383,12 +390,8 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
 
     fs::create_dir_all(&args.output_dir)?;
     let mut session = SessionState::new();
-    let mut current_file = ArchiveFile::new(
-        &args.output_dir,
-        &args.base_name,
-        session.file_index,
-        args.compression_level,
-    )?;
+    let mut current_file =
+        ArchiveFile::new(&args.output_dir, &args.base_name, args.compression_level)?;
     log::info!("Created archive file: {}", current_file.path.display());
 
     loop {
@@ -431,8 +434,8 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         }
     }
 
-    let total_files = session.file_index + 1;
     close_file(current_file, &mut session, &args)?;
+    let total_files = session.manifest_files.len();
     let total_events: u64 = session.manifest_files.iter().map(|f| f.events).sum();
 
     log::info!(
@@ -450,13 +453,14 @@ fn close_file(
     session: &mut SessionState,
     args: &Args,
 ) -> std::io::Result<()> {
-    let ext = if args.compression_level > 0 {
-        "bin.zst"
-    } else {
-        "bin"
-    };
-    let name = format!("{}.{}.{}", args.base_name, session.file_index, ext);
-    let (_path, entry) = current_file.finalize(name)?;
+    let name = current_file
+        .path
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let (_path, entry) = current_file.finalize(name, &args.nats.address)?;
     session.manifest_files.push(entry);
 
     write_manifest(session, args)
@@ -469,13 +473,7 @@ fn rotate(
     args: &Args,
 ) -> std::io::Result<ArchiveFile> {
     close_file(current_file, session, args)?;
-    session.file_index += 1;
-    ArchiveFile::new(
-        &args.output_dir,
-        &args.base_name,
-        session.file_index,
-        args.compression_level,
-    )
+    ArchiveFile::new(&args.output_dir, &args.base_name, args.compression_level)
 }
 
 fn should_archive(event: &Event, args: &Args) -> bool {
@@ -512,24 +510,13 @@ fn event_type_name(event: &Event) -> Option<&'static str> {
 }
 
 fn write_manifest(session: &SessionState, args: &Args) -> std::io::Result<()> {
-    let finished_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
     let manifest = Manifest {
-        session: Session {
-            version: VERSION,
-            nats_address: args.nats.address.clone(),
-            created_at: session.created_at,
-            finished_at,
-            total_events: session.manifest_files.iter().map(|file| file.events).sum(),
-            total_files: session.manifest_files.len() as u32,
-        },
         files: &session.manifest_files,
     };
-    let manifest_path = args
-        .output_dir
-        .join(format!("{}.manifest.toml", args.base_name));
+    let manifest_path = args.output_dir.join(format!(
+        "{}.{}.manifest.toml",
+        args.base_name, session.started_at_ms
+    ));
     let toml_str = toml::to_string_pretty(&manifest).map_err(std::io::Error::other)?;
     fs::write(&manifest_path, &toml_str)?;
     log::info!("wrote manifest: {}", manifest_path.display());
