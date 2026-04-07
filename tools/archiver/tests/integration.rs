@@ -245,7 +245,7 @@ async fn run_filter_test(flag: &str, expected_count: usize) {
     let archive_path = find_files(&tmp_dir, ".bin.zst")
         .into_iter()
         .next()
-        .expect("expected a .0.bin.zst file");
+        .expect("expected a .<timestamp>.bin.zst file");
     let file = File::open(archive_path).unwrap();
     let mut reader = zstd::Decoder::new(file).unwrap();
 
@@ -428,7 +428,7 @@ async fn test_replayer_roundtrip() {
     let archive_path = find_files(&tmp_dir, ".bin.zst")
         .into_iter()
         .next()
-        .expect("expected a .0.bin.zst file");
+        .expect("expected a .<timestamp>.bin.zst file");
     let archive = replayer::read_archive(&archive_path).unwrap();
 
     assert_eq!(archive.header.version, 1);
