@@ -354,7 +354,7 @@ pub struct Args {
 
 impl Args {
     /// Returns true if all event types should be archived (no filters specified).
-    pub fn show_all(&self) -> bool {
+    pub fn compress_all(&self) -> bool {
         !(self.messages
             || self.connections
             || self.addrman
@@ -367,10 +367,10 @@ impl Args {
 }
 
 pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(), RuntimeError> {
-    if args.show_all() {
-        log::info!("archiving all events: {}", args.show_all());
+    if args.compress_all() {
+        log::info!("archiving all events: {}", args.compress_all());
     } else {
-        log::info!("archiving all events:           {}", args.show_all());
+        log::info!("archiving all events:           {}", args.compress_all());
         log::info!("archiving P2P messages:         {}", args.messages);
         log::info!("archiving P2P connections:      {}", args.connections);
         log::info!("archiving addrman events:       {}", args.addrman);
@@ -477,7 +477,7 @@ fn rotate(
 }
 
 fn should_archive(event: &Event, args: &Args) -> bool {
-    if args.show_all() {
+    if args.compress_all() {
         return true;
     }
     match event_type_name(event) {

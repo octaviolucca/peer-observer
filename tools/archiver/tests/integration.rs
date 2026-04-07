@@ -224,7 +224,7 @@ async fn run_filter_test(flag: &str, expected_count: usize) {
             "rpc" => args.rpc = true,
             "p2p_extractor" => args.p2p_extractor = true,
             "log_extractor" => args.log_extractor = true,
-            _ => {} // show_all
+            _ => {} // compress_all
         }
         archiver::run(args, shutdown_rx).await.unwrap();
     });
