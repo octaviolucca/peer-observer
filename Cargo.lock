@@ -96,7 +96,6 @@ dependencies = [
  "sha2",
  "shared",
  "toml",
- "zstd",
 ]
 
 [[package]]
@@ -1670,7 +1669,6 @@ name = "replayer"
 version = "0.1.0"
 dependencies = [
  "shared",
- "zstd",
 ]
 
 [[package]]
@@ -2001,6 +1999,7 @@ dependencies = [
  "simple_logger",
  "time",
  "tokio",
+ "zstd",
 ]
 
 [[package]]

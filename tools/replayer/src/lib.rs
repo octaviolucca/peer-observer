@@ -5,6 +5,7 @@ use std::path::Path;
 
 use shared::prost::Message;
 use shared::protobuf::event::Event;
+use shared::zstd;
 
 const HEADER_SIZE: usize = 16;
 

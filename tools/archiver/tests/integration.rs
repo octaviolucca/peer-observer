@@ -25,6 +25,7 @@ use shared::{
     simple_logger,
     testing::{nats_publisher::NatsPublisherForTesting, nats_server::NatsServerForTesting},
     tokio::{self, sync::watch, time::sleep},
+    zstd,
 };
 use std::{fs::File, io::Read, sync::Once, time::Duration};
 

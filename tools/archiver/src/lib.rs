@@ -21,6 +21,7 @@ use shared::protobuf::ebpf_extractor::ebpf;
 use shared::protobuf::event::event::PeerObserverEvent;
 use shared::protobuf::event::Event;
 use shared::tokio::sync::watch;
+use shared::zstd;
 
 const MAGIC: [u8; 2] = *b"PA";
 const VERSION: u8 = 1;
