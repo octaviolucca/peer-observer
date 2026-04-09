@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Slow Blocks on Signet — Round 2</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f3ea;
+      --panel: #fffdf8;
+      --ink: #1f2937;
+      --muted: #6b7280;
+      --accent: #8b5e34;
+      --border: #dccfb8;
+      --diagram-scale: 1.0;
+    }
+    body {
+      margin: 0;
+      font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
+      background:
+        radial-gradient(circle at top left, rgba(206, 179, 140, 0.18), transparent 30rem),
+        linear-gradient(180deg, #f5efe2 0%, var(--bg) 100%);
+      color: var(--ink);
+    }
+    main {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 32px 24px 64px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: clamp(2rem, 3vw, 3.2rem);
+      line-height: 1;
+      letter-spacing: -0.03em;
+    }
+    p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 1rem;
+    }
+    .topbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      align-items: center;
+      margin: 14px 0 6px;
+      font-size: 0.98rem;
+    }
+    .topbar a {
+      color: var(--accent);
+      text-decoration: none;
+      border-bottom: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    }
+    .topbar a:hover {
+      border-bottom-color: var(--accent);
+    }
+    .topbar .label {
+      color: var(--muted);
+    }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 16px 0 2px;
+    }
+    .toolbar {
+      display: none;
+    }
+    body.embed-mode main > h1,
+    body.embed-mode main > p,
+    body.embed-mode .topbar,
+    body.embed-mode .toolbar {
+      display: none;
+    }
+    body.embed-mode main {
+      padding-top: 12px;
+    }
+    body.embed-mode .panel:first-of-type {
+      margin-top: 0;
+    }
+    .panel {
+      margin-top: 24px;
+      padding: 20px;
+      background: color-mix(in srgb, var(--panel) 92%, white);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      box-shadow: 0 12px 40px rgba(76, 53, 28, 0.09);
+      overflow-x: auto;
+    }
+    .mermaid {
+      min-width: max-content;
+    }
+    .mermaid svg {
+      transform: scale(var(--diagram-scale));
+      transform-origin: top left;
+    }
+    .meta {
+      margin-top: 10px;
+      font-size: 0.95rem;
+      color: var(--muted);
+    }
+    .section-title {
+      margin: 0;
+      font-size: 1.4rem;
+      letter-spacing: -0.02em;
+    }
+    table.summary {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 0.95rem;
+    }
+    table.summary th {
+      text-align: left;
+      padding: 8px 12px;
+      border-bottom: 2px solid var(--border);
+      color: var(--muted);
+      font-weight: 600;
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    table.summary td {
+      padding: 8px 12px;
+      border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
+    }
+    table.summary tr:last-child td {
+      border-bottom: none;
+    }
+    table.summary .mono {
+      font-family: "SF Mono", "Menlo", "Consolas", monospace;
+      font-size: 0.88rem;
+    }
+    table.summary .slow {
+      color: var(--accent);
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Slow Blocks on Signet — Round 2</h1>
+    <p>2636 filtered events rendered into 6 focused block diagrams. Story mode: delving. Max visible peers: 6.</p>
+    <div class="topbar"><span class="label">Views:</span><a href="slow-blocks-delving-round1.html">Round 1</a><a href="slow-blocks-delving-round2.html">Round 2</a><span class="label">Reference:</span><a href="https://delvingbitcoin.org/t/consensus-cleanup-demo-of-slow-blocks-on-signet/2367/39">Delving Bitcoin</a></div>
+    <div class="toolbar">
+      <button type="button" id="show-top-only">Show Only Top Diagram</button>
+      <button type="button" id="show-all">Show All Diagrams</button>
+    </div>
+    <section class="panel"><h2 class="section-title">Overview</h2><p class="meta">6 slow blocks</p><table class="summary">
+<thead><tr>
+<th>Height</th><th>Block</th><th>First from</th><th>ConnectBlock</th><th>Relay after</th>
+</tr></thead>
+<tbody>
+<tr><td>299177</td><td class="mono">0000000eb552</td><td>peer3</td><td class="slow">80.84s</td><td>1077ms</td></tr>
+<tr><td>299178</td><td class="mono">000000002b3a</td><td>peer3</td><td class="slow">81.21s</td><td>976ms</td></tr>
+<tr><td>299179</td><td class="mono">00000006d340</td><td>peer3</td><td class="slow">75.44s</td><td>845ms</td></tr>
+<tr><td>299180</td><td class="mono">00000014a4ca</td><td>peer3</td><td class="slow">77.55s</td><td>893ms</td></tr>
+<tr><td>299181</td><td class="mono">000000032204</td><td>peer3</td><td class="slow">77.54s</td><td>955ms</td></tr>
+<tr><td>299182</td><td class="mono">000000143c97</td><td>peer3</td><td class="slow">92.50s</td><td>1000ms</td></tr>
+</tbody></table></section>
+<section class="panel"><h2 class="section-title">Block 0000000eb552</h2><p class="meta">hash=0000000eb552c9f26e712d546c71297fd0623890299b40e7ada81d2dc32f5d0b | shown=7 | connect=80.84s | first=peer3 | height=299177</p><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant peer3
+    participant node
+    participant peer11
+    participant peer8
+    participant peer9
+    peer3-&gt;&gt;node: CmpctBlock
+    node-&gt;&gt;peer3: GetBlockTxn
+    peer3-&gt;&gt;node: BlockTxn(1)
+    Note over node: ConnectBlock 80.84s (h=299177)
+    node-&gt;&gt;peer11: Headers(1)
+    node-&gt;&gt;peer8: Headers(1)
+    node-&gt;&gt;peer9: Headers(1)</pre></section>
+<section class="panel"><h2 class="section-title">Block 000000002b3a</h2><p class="meta">hash=000000002b3a132836666c18f5e1a9d93623d3797316a968ee54e47fb44c0c13 | shown=7 | connect=81.21s | first=peer3 | height=299178</p><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant peer3
+    participant node
+    participant peer7
+    participant peer16
+    participant peer13
+    peer3-&gt;&gt;node: CmpctBlock
+    node-&gt;&gt;peer3: GetBlockTxn
+    peer3-&gt;&gt;node: BlockTxn(1)
+    Note over node: ConnectBlock 81.21s (h=299178)
+    node-&gt;&gt;peer7: Headers(1)
+    node-&gt;&gt;peer16: Headers(1)
+    node-&gt;&gt;peer13: Headers(1)</pre></section>
+<section class="panel"><h2 class="section-title">Block 00000006d340</h2><p class="meta">hash=00000006d34037534a517f9e5809a34766f1540c0e6817eac91b1adfee50cb5f | shown=7 | connect=75.44s | first=peer3 | height=299179</p><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant peer3
+    participant node
+    participant peer73
+    participant peer10
+    participant peer9
+    peer3-&gt;&gt;node: CmpctBlock
+    node-&gt;&gt;peer3: GetBlockTxn
+    peer3-&gt;&gt;node: BlockTxn(1)
+    Note over node: ConnectBlock 75.44s (h=299179)
+    node-&gt;&gt;peer73: Headers(1)
+    node-&gt;&gt;peer10: Headers(1)
+    node-&gt;&gt;peer9: Headers(1)</pre></section>
+<section class="panel"><h2 class="section-title">Block 00000014a4ca</h2><p class="meta">hash=00000014a4cae4501f98539b45c76059c706a82b77f19a9adf365b3f5e989444 | shown=7 | connect=77.55s | first=peer3 | height=299180</p><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant peer3
+    participant node
+    participant peer15
+    participant peer4
+    participant peer13
+    peer3-&gt;&gt;node: CmpctBlock
+    node-&gt;&gt;peer3: GetBlockTxn
+    peer3-&gt;&gt;node: BlockTxn(1)
+    Note over node: ConnectBlock 77.55s (h=299180)
+    node-&gt;&gt;peer15: Headers(1)
+    node-&gt;&gt;peer4: Headers(1)
+    node-&gt;&gt;peer13: Headers(1)</pre></section>
+<section class="panel"><h2 class="section-title">Block 000000032204</h2><p class="meta">hash=00000003220437cb8b5a2edef6be828c5cdad114b1b642d724ac6f3caa7f12fb | shown=7 | connect=77.54s | first=peer3 | height=299181</p><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant peer3
+    participant node
+    participant peer13
+    participant peer40
+    participant peer2
+    peer3-&gt;&gt;node: CmpctBlock
+    node-&gt;&gt;peer3: GetBlockTxn
+    peer3-&gt;&gt;node: BlockTxn(1)
+    Note over node: ConnectBlock 77.54s (h=299181)
+    node-&gt;&gt;peer13: Headers(1)
+    node-&gt;&gt;peer40: Headers(1)
+    node-&gt;&gt;peer2: Headers(1)</pre></section>
+<section class="panel"><h2 class="section-title">Block 000000143c97</h2><p class="meta">hash=000000143c97bf0134c5cf0881dfd4ef458529b7388cacf43981ffe92fb96856 | shown=7 | connect=92.50s | first=peer3 | height=299182</p><pre class="mermaid">sequenceDiagram
+    autonumber
+    participant peer3
+    participant node
+    participant peer11
+    participant peer7
+    participant peer16
+    peer3-&gt;&gt;node: CmpctBlock
+    node-&gt;&gt;peer3: GetBlockTxn
+    peer3-&gt;&gt;node: BlockTxn(1)
+    Note over node: ConnectBlock 92.50s (h=299182)
+    node-&gt;&gt;peer11: Headers(2)
+    node-&gt;&gt;peer16: Headers(2)
+    node-&gt;&gt;peer7: Headers(2)</pre></section>
+  </main>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "base",
+      themeVariables: {
+        primaryColor: "#f1e4c8",
+        primaryTextColor: "#1f2937",
+        primaryBorderColor: "#8b5e34",
+        lineColor: "#7b5d42",
+        actorBorder: "#8b5e34",
+        actorBkg: "#fffaf0",
+        actorTextColor: "#1f2937",
+        signalColor: "#6b4f35",
+        signalTextColor: "#1f2937",
+        noteBkgColor: "#fff4d8",
+        noteBorderColor: "#b0814d",
+        noteTextColor: "#1f2937",
+        sequenceNumberColor: "#1f2937"
+      },
+      sequence: {
+        useMaxWidth: true,
+        wrap: true,
+        diagramMarginX: 10,
+        diagramMarginY: 10,
+        actorMargin: 28,
+        messageMargin: 12
+      }
+    });
+
+    const panels = Array.from(document.querySelectorAll('.panel'));
+    const showTopOnly = document.getElementById('show-top-only');
+    const showAll = document.getElementById('show-all');
+
+    showTopOnly?.addEventListener('click', () => {
+      panels.forEach((panel, index) => {
+        panel.style.display = index === 0 ? '' : 'none';
+      });
+    });
+
+    showAll?.addEventListener('click', () => {
+      panels.forEach((panel) => {
+        panel.style.display = '';
+      });
+    });
+
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('embed') === '1') {
+      document.body.classList.add('embed-mode');
+    }
+  </script>
+</body>
+</html>
