@@ -8,6 +8,9 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use time::macros::format_description;
+use time::OffsetDateTime;
+
 use sha2::{Digest, Sha256};
 use shared::serde::Serialize;
 
@@ -206,11 +209,13 @@ impl ArchiveFile {
         };
         // Retry on rare timestamp collisions (e.g. fast rotations in tests)
         let (path, file) = loop {
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-            let path = output_dir.join(format!("{}.{}.{}", base_name, ts, ext));
+            let timestamp = format_utc_timestamp(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64,
+            );
+            let path = output_dir.join(format!("{}.{}.{}", base_name, timestamp, ext));
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -224,7 +229,7 @@ impl ArchiveFile {
                     return Err(std::io::Error::new(
                         e.kind(),
                         format!("failed to create archive {}: {}", path.display(), e),
-                    ))
+                    ));
                 }
             }
         };
@@ -516,10 +521,19 @@ fn write_manifest(session: &SessionState, args: &Args) -> std::io::Result<()> {
     };
     let manifest_path = args.output_dir.join(format!(
         "{}.{}.manifest.toml",
-        args.base_name, session.started_at_ms
+        args.base_name,
+        format_utc_timestamp(session.started_at_ms)
     ));
     let toml_str = toml::to_string_pretty(&manifest).map_err(std::io::Error::other)?;
     fs::write(&manifest_path, &toml_str)?;
     log::info!("wrote manifest: {}", manifest_path.display());
     Ok(())
+}
+
+fn format_utc_timestamp(epoch_ms: u64) -> String {
+    let fmt = format_description!("[year][month][day]-[hour][minute][second]-[subsecond digits:3]");
+    OffsetDateTime::from_unix_timestamp_nanos(epoch_ms as i128 * 1_000_000)
+        .expect("timestamp out of range")
+        .format(&fmt)
+        .expect("timestamp formatting failed")
 }
