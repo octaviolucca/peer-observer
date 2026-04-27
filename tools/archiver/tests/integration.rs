@@ -10,7 +10,6 @@ use shared::{
     prost::Message,
     protobuf::{
         ebpf_extractor::{
-            addrman::{self, InsertNew},
             connection::{self, Connection, InboundConnection},
             ebpf,
             mempool::{self, Added},
@@ -63,7 +62,6 @@ fn make_test_args(nats_port: u16, output_dir: &std::path::Path) -> Args {
         log_level: log::Level::Info,
         messages: false,
         connections: false,
-        addrman: false,
         mempool: false,
         validation: false,
         rpc: false,
@@ -113,25 +111,7 @@ fn make_all_event_types() -> Vec<(Event, &'static str)> {
             .unwrap(),
             "connections",
         ),
-        // 3. ebpf addrman
-        (
-            Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
-                ebpf_event: Some(ebpf::EbpfEvent::Addrman(addrman::AddrmanEvent {
-                    event: Some(addrman::addrman_event::Event::New(InsertNew {
-                        addr: "127.0.0.1:8333".to_string(),
-                        addr_as: 1,
-                        bucket: 1,
-                        bucket_pos: 1,
-                        inserted: true,
-                        source: "127.0.0.1:8333".to_string(),
-                        source_as: 0,
-                    })),
-                })),
-            }))
-            .unwrap(),
-            "addrman",
-        ),
-        // 4. ebpf mempool
+        // 3. ebpf mempool
         (
             Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
                 ebpf_event: Some(ebpf::EbpfEvent::Mempool(mempool::MempoolEvent {
@@ -219,7 +199,6 @@ async fn run_filter_test(flag: &str, expected_count: usize) {
         match flag_owned.as_str() {
             "messages" => args.messages = true,
             "connections" => args.connections = true,
-            "addrman" => args.addrman = true,
             "mempool" => args.mempool = true,
             "validation" => args.validation = true,
             "rpc" => args.rpc = true,
@@ -274,7 +253,7 @@ async fn run_filter_test(flag: &str, expected_count: usize) {
 
 #[tokio::test]
 async fn test_filter_all() {
-    run_filter_test("all", 8).await;
+    run_filter_test("all", 7).await;
 }
 
 #[tokio::test]
@@ -285,11 +264,6 @@ async fn test_filter_messages() {
 #[tokio::test]
 async fn test_filter_connections() {
     run_filter_test("connections", 1).await;
-}
-
-#[tokio::test]
-async fn test_filter_addrman() {
-    run_filter_test("addrman", 1).await;
 }
 
 #[tokio::test]
@@ -390,7 +364,7 @@ async fn test_file_rotation_with_compression() {
     println!("total events:  {}", total_events);
     println!("===================================\n");
 
-    assert_eq!(total_events, 8);
+    assert_eq!(total_events, 7);
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }

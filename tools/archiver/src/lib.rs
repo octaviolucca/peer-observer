@@ -329,10 +329,6 @@ pub struct Args {
     #[arg(long)]
     pub connections: bool,
 
-    /// If passed, archive addrman events.
-    #[arg(long)]
-    pub addrman: bool,
-
     /// If passed, archive mempool events.
     #[arg(long)]
     pub mempool: bool,
@@ -363,7 +359,6 @@ impl Args {
     pub fn compress_all(&self) -> bool {
         !(self.messages
             || self.connections
-            || self.addrman
             || self.mempool
             || self.validation
             || self.rpc
@@ -379,7 +374,6 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         log::info!("archiving all events:           {}", args.compress_all());
         log::info!("archiving P2P messages:         {}", args.messages);
         log::info!("archiving P2P connections:      {}", args.connections);
-        log::info!("archiving addrman events:       {}", args.addrman);
         log::info!("archiving mempool events:       {}", args.mempool);
         log::info!("archiving validation events:    {}", args.validation);
         log::info!("archiving rpc events:           {}", args.rpc);
@@ -489,7 +483,6 @@ fn should_archive(event: &Event, args: &Args) -> bool {
     match event_type_name(event) {
         Some("messages") => args.messages,
         Some("connections") => args.connections,
-        Some("addrman") => args.addrman,
         Some("mempool") => args.mempool,
         Some("validation") => args.validation,
         Some("rpc") => args.rpc,
@@ -504,7 +497,6 @@ fn event_type_name(event: &Event) -> Option<&'static str> {
         PeerObserverEvent::EbpfExtractor(e) => match e.ebpf_event.as_ref()? {
             ebpf::EbpfEvent::Message(_) => "messages",
             ebpf::EbpfEvent::Connection(_) => "connections",
-            ebpf::EbpfEvent::Addrman(_) => "addrman",
             ebpf::EbpfEvent::Mempool(_) => "mempool",
             ebpf::EbpfEvent::Validation(_) => "validation",
         },
