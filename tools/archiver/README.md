@@ -23,9 +23,8 @@ to record the file, allowing future readers to check out that commit if needed.
 
 ## Manifest
 
-Each recording session produces a `<base-name>.<timestamp>.manifest.toml` file alongside the
-archive files. The manifest is updated on every file rotation and on shutdown. It contains per-file
-metadata (version, NATS address, event count, uncompressed size, SHA-256 checksum, event types,
+Each archive file has a corresponding `<base-name>.<timestamp>.manifest.toml` with its metadata
+(version, NATS address, event count, uncompressed size, SHA-256 checksum, event types,
 first/last timestamps).
 
 ## Compression
@@ -86,8 +85,6 @@ Options:
           If passed, archive P2P message events
       --connections
           If passed, archive P2P connection events
-      --addrman
-          If passed, archive addrman events
       --mempool
           If passed, archive mempool events
       --validation

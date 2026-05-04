@@ -336,6 +336,26 @@ async fn test_file_rotation_with_compression() {
         zst_files.len()
     );
 
+    let manifest_files = find_files(&tmp_dir, ".manifest.toml");
+    let mut archive_names: Vec<_> = zst_files
+        .iter()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    let mut manifest_names: Vec<_> = manifest_files
+        .iter()
+        .map(|p| {
+            let manifest_str = std::fs::read_to_string(p).unwrap();
+            let manifest: toml::Value = manifest_str.parse().unwrap();
+            manifest["name"].as_str().unwrap().to_string()
+        })
+        .collect();
+    archive_names.sort();
+    manifest_names.sort();
+    assert_eq!(
+        archive_names, manifest_names,
+        "each manifest must reference exactly one unique archive file"
+    );
+
     // decompress and count total events
     let mut total_events = 0;
     for entry in &zst_files {
@@ -504,51 +524,47 @@ async fn test_compression_integrity() {
         .expect("expected a manifest file");
     let manifest_str = std::fs::read_to_string(manifest_path).unwrap();
     let manifest: toml::Value = manifest_str.parse().unwrap();
-    let files = manifest["files"].as_array().unwrap();
+    let zst_name = manifest["name"].as_str().unwrap();
+    let expected_checksum = manifest["checksum"].as_str().unwrap();
 
-    for entry in files {
-        let zst_name = entry["name"].as_str().unwrap();
-        let expected_checksum = entry["checksum"].as_str().unwrap();
+    let zst_path = tmp_dir.join(zst_name);
+    let bin_path = tmp_dir.join(zst_name.strip_suffix(".zst").unwrap());
 
-        let zst_path = tmp_dir.join(zst_name);
-        let bin_path = tmp_dir.join(zst_name.strip_suffix(".zst").unwrap());
+    assert!(zst_path.exists(), "{} should exist", zst_name);
+    assert!(
+        !bin_path.exists(),
+        "{} should have been deleted",
+        bin_path.display()
+    );
 
-        assert!(zst_path.exists(), "{} should exist", zst_name);
-        assert!(
-            !bin_path.exists(),
-            "{} should have been deleted",
-            bin_path.display()
-        );
+    let file = File::open(&zst_path).unwrap();
+    let mut decoder = zstd::Decoder::new(file).unwrap();
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed).unwrap();
 
-        let file = File::open(&zst_path).unwrap();
-        let mut decoder = zstd::Decoder::new(file).unwrap();
-        let mut decompressed = Vec::new();
-        decoder.read_to_end(&mut decompressed).unwrap();
+    let actual_checksum = format!("{:x}", sha2::Sha256::digest(&decompressed));
 
-        let actual_checksum = format!("{:x}", sha2::Sha256::digest(&decompressed));
+    assert_eq!(
+        actual_checksum, expected_checksum,
+        "decompressed SHA-256 of {} must match manifest checksum",
+        zst_name
+    );
 
-        assert_eq!(
-            actual_checksum, expected_checksum,
-            "decompressed SHA-256 of {} must match manifest checksum",
-            zst_name
-        );
+    let compressed_checksum = manifest["compressed_checksum"].as_str().unwrap();
+    let compressed_size = manifest["compressed_size_bytes"].as_integer().unwrap() as u64;
 
-        let compressed_checksum = entry["compressed_checksum"].as_str().unwrap();
-        let compressed_size = entry["compressed_size_bytes"].as_integer().unwrap() as u64;
+    let raw_zst = std::fs::read(&zst_path).unwrap();
+    let actual_compressed_checksum = format!("{:x}", sha2::Sha256::digest(&raw_zst));
+    assert_eq!(
+        actual_compressed_checksum, compressed_checksum,
+        "SHA-256 of raw .zst must match manifest compressed_checksum"
+    );
 
-        let raw_zst = std::fs::read(&zst_path).unwrap();
-        let actual_compressed_checksum = format!("{:x}", sha2::Sha256::digest(&raw_zst));
-        assert_eq!(
-            actual_compressed_checksum, compressed_checksum,
-            "SHA-256 of raw .zst must match manifest compressed_checksum"
-        );
-
-        let file_size = std::fs::metadata(&zst_path).unwrap().len();
-        assert_eq!(
-            compressed_size, file_size,
-            "compressed_size_bytes must match file size on disk"
-        );
-    }
+    let file_size = std::fs::metadata(&zst_path).unwrap().len();
+    assert_eq!(
+        compressed_size, file_size,
+        "compressed_size_bytes must match file size on disk"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
@@ -597,24 +613,23 @@ async fn test_no_compression() {
         .expect("expected a manifest file");
     let manifest_str = std::fs::read_to_string(manifest_path).unwrap();
     let manifest: toml::Value = manifest_str.parse().unwrap();
-    let files = manifest["files"].as_array().unwrap();
-    assert!(files[0]["name"].as_str().unwrap().ends_with(".bin"));
+    assert!(manifest["name"].as_str().unwrap().ends_with(".bin"));
 
     // checksum should match raw file content
     let raw = std::fs::read(&bin_files[0]).unwrap();
     let actual_checksum = format!("{:x}", sha2::Sha256::digest(&raw));
-    let expected_checksum = files[0]["checksum"].as_str().unwrap();
+    let expected_checksum = manifest["checksum"].as_str().unwrap();
     assert_eq!(
         actual_checksum, expected_checksum,
         "SHA-256 of raw .bin must match manifest checksum"
     );
 
     assert!(
-        files[0].get("compressed_checksum").is_none(),
+        manifest.get("compressed_checksum").is_none(),
         "compressed_checksum should not be present without compression"
     );
     assert!(
-        files[0].get("compressed_size_bytes").is_none(),
+        manifest.get("compressed_size_bytes").is_none(),
         "compressed_size_bytes should not be present without compression"
     );
 

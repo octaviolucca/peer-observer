@@ -60,12 +60,6 @@ impl ArchiveHeader {
 
 #[derive(Serialize)]
 #[serde(crate = "shared::serde")]
-struct Manifest<'a> {
-    files: &'a [FileEntry],
-}
-
-#[derive(Serialize)]
-#[serde(crate = "shared::serde")]
 struct FileEntry {
     name: String,
     version: u8,
@@ -80,24 +74,6 @@ struct FileEntry {
     compressed_size_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compressed_checksum: Option<String>,
-}
-
-/// Holds state that persists across file rotations.
-struct SessionState {
-    started_at_ms: u64,
-    manifest_files: Vec<FileEntry>,
-}
-
-impl SessionState {
-    fn new() -> Self {
-        Self {
-            started_at_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
-            manifest_files: Vec::new(),
-        }
-    }
 }
 
 struct TrackingWriter {
@@ -191,6 +167,7 @@ impl Write for ArchiveWriter {
 /// check needs_rotation().
 struct ArchiveFile {
     path: PathBuf,
+    formatted_timestamp: String,
     writer: ArchiveWriter,
     hasher: Sha256,
     bytes_written: u64,
@@ -208,20 +185,20 @@ impl ArchiveFile {
             "bin"
         };
         // Retry on rare timestamp collisions (e.g. fast rotations in tests)
-        let (path, file) = loop {
-            let timestamp = format_utc_timestamp(
+        let (path, formatted_timestamp, file) = loop {
+            let formatted_timestamp = format_utc_timestamp(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as u64,
             );
-            let path = output_dir.join(format!("{}.{}.{}", base_name, timestamp, ext));
+            let path = output_dir.join(format!("{}.{}.{}", base_name, formatted_timestamp, ext));
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
-                Ok(file) => break (path, file),
+                Ok(file) => break (path, formatted_timestamp, file),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
@@ -242,6 +219,7 @@ impl ArchiveFile {
         writer.flush()?;
         Ok(Self {
             path,
+            formatted_timestamp,
             writer,
             hasher,
             bytes_written: HEADER_SIZE as u64,
@@ -275,7 +253,7 @@ impl ArchiveFile {
         }
     }
 
-    fn finalize(self, name: String, nats_address: &str) -> std::io::Result<(PathBuf, FileEntry)> {
+    fn finalize(self, name: String, nats_address: &str) -> std::io::Result<FileEntry> {
         let compressed_stats = self.writer.finish()?;
         let checksum = format!("{:x}", self.hasher.finalize());
         let mut sorted_types: Vec<String> =
@@ -294,7 +272,7 @@ impl ArchiveFile {
             compressed_size_bytes: compressed_stats.as_ref().map(|s| s.size_bytes),
             compressed_checksum: compressed_stats.map(|s| s.checksum),
         };
-        Ok((self.path, entry))
+        Ok(entry)
     }
 }
 
@@ -389,10 +367,12 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     log::info!("Connected to NATS-server at {}", args.nats.address);
 
     fs::create_dir_all(&args.output_dir)?;
-    let mut session = SessionState::new();
     let mut current_file =
         ArchiveFile::new(&args.output_dir, &args.base_name, args.compression_level)?;
     log::info!("Created archive file: {}", current_file.path.display());
+
+    let mut total_events: u64 = 0;
+    let mut total_files: u64 = 0;
 
     loop {
         shared::tokio::select! {
@@ -409,7 +389,10 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
                         current_file.write_event(&event)?;
 
                         if current_file.needs_rotation(args.max_file_size) {
-                            current_file = rotate(current_file, &mut session, &args)?;
+                            let (total_file_events, new_file) = rotate(current_file, &args)?;
+                            total_events += total_file_events;
+                            total_files += 1;
+                            current_file = new_file
                         }
                     }
                 } else {
@@ -434,9 +417,8 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         }
     }
 
-    close_file(current_file, &mut session, &args)?;
-    let total_files = session.manifest_files.len();
-    let total_events: u64 = session.manifest_files.iter().map(|f| f.events).sum();
+    total_events += close_file(current_file, &args)?;
+    total_files += 1;
 
     log::info!(
         "shutting down. total events archived: {}, files: {}",
@@ -448,11 +430,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
 
 /// Finalizes the current archive file, adds its FileEntry to the manifest,
 /// and writes the manifest to disk.
-fn close_file(
-    current_file: ArchiveFile,
-    session: &mut SessionState,
-    args: &Args,
-) -> std::io::Result<()> {
+fn close_file(current_file: ArchiveFile, args: &Args) -> std::io::Result<u64> {
     let name = current_file
         .path
         .file_name()
@@ -460,20 +438,22 @@ fn close_file(
         .to_str()
         .unwrap()
         .to_string();
-    let (_path, entry) = current_file.finalize(name, &args.nats.address)?;
-    session.manifest_files.push(entry);
 
-    write_manifest(session, args)
+    let manifest_path = args.output_dir.join(format!(
+        "{}.{}.manifest.toml",
+        args.base_name, current_file.formatted_timestamp
+    ));
+    let entry = current_file.finalize(name, &args.nats.address)?;
+
+    write_manifest(&entry, &manifest_path)?;
+    Ok(entry.events)
 }
 
 /// Closes the current archive file and opens the next one.
-fn rotate(
-    current_file: ArchiveFile,
-    session: &mut SessionState,
-    args: &Args,
-) -> std::io::Result<ArchiveFile> {
-    close_file(current_file, session, args)?;
-    ArchiveFile::new(&args.output_dir, &args.base_name, args.compression_level)
+fn rotate(current_file: ArchiveFile, args: &Args) -> std::io::Result<(u64, ArchiveFile)> {
+    let total_events = close_file(current_file, args)?;
+    let new_file = ArchiveFile::new(&args.output_dir, &args.base_name, args.compression_level)?;
+    Ok((total_events, new_file))
 }
 
 fn should_archive(event: &Event, args: &Args) -> bool {
@@ -507,18 +487,10 @@ fn event_type_name(event: &Event) -> Option<&'static str> {
     Some(name)
 }
 
-fn write_manifest(session: &SessionState, args: &Args) -> std::io::Result<()> {
-    let manifest = Manifest {
-        files: &session.manifest_files,
-    };
-    let manifest_path = args.output_dir.join(format!(
-        "{}.{}.manifest.toml",
-        args.base_name,
-        format_utc_timestamp(session.started_at_ms)
-    ));
-    let toml_str = toml::to_string_pretty(&manifest).map_err(std::io::Error::other)?;
-    fs::write(&manifest_path, &toml_str)?;
-    log::info!("wrote manifest: {}", manifest_path.display());
+fn write_manifest(entry: &FileEntry, path: &Path) -> std::io::Result<()> {
+    let toml_str = toml::to_string_pretty(entry).map_err(std::io::Error::other)?;
+    fs::write(path, &toml_str)?;
+    log::info!("wrote manifest: {}", path.display());
     Ok(())
 }
 
