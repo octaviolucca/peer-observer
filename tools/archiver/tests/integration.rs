@@ -67,12 +67,12 @@ fn make_test_args(nats_port: u16, output_dir: &std::path::Path) -> Args {
         rpc: false,
         p2p_extractor: false,
         log_extractor: false,
-        compression_level: 22,
+        compression_level: 3,
     }
 }
 
 fn make_all_event_types() -> Vec<(Event, &'static str)> {
-    vec![
+    let events = vec![
         // 1. ebpf message
         (
             Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
@@ -179,7 +179,23 @@ fn make_all_event_types() -> Vec<(Event, &'static str)> {
             .unwrap(),
             "log_extractor",
         ),
-    ]
+    ];
+
+    // Compile-time check: if a new PeerObserverEvent variant is added,
+    // this match becomes non-exhaustive and fails to compile.
+    match events[0].0.peer_observer_event.as_ref().unwrap() {
+        PeerObserverEvent::EbpfExtractor(e) => match e.ebpf_event.as_ref().unwrap() {
+            ebpf::EbpfEvent::Message(_) => (),
+            ebpf::EbpfEvent::Connection(_) => (),
+            ebpf::EbpfEvent::Mempool(_) => (),
+            ebpf::EbpfEvent::Validation(_) => (),
+        },
+        PeerObserverEvent::RpcExtractor(_) => (),
+        PeerObserverEvent::P2pExtractor(_) => (),
+        PeerObserverEvent::LogExtractor(_) => (),
+    }
+
+    events
 }
 
 async fn run_filter_test(flag: &str, expected_count: usize) {
@@ -204,7 +220,7 @@ async fn run_filter_test(flag: &str, expected_count: usize) {
             "rpc" => args.rpc = true,
             "p2p_extractor" => args.p2p_extractor = true,
             "log_extractor" => args.log_extractor = true,
-            _ => {} // compress_all
+            _ => {} // archive_all
         }
         archiver::run(args, shutdown_rx).await.unwrap();
     });

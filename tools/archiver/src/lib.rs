@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "strict", deny(warnings))]
+
 mod error;
 
 pub use error::RuntimeError;
@@ -334,7 +336,7 @@ pub struct Args {
 
 impl Args {
     /// Returns true if all event types should be archived (no filters specified).
-    pub fn compress_all(&self) -> bool {
+    pub fn archive_all(&self) -> bool {
         !(self.messages
             || self.connections
             || self.mempool
@@ -346,10 +348,10 @@ impl Args {
 }
 
 pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(), RuntimeError> {
-    if args.compress_all() {
-        log::info!("archiving all events: {}", args.compress_all());
+    if args.archive_all() {
+        log::info!("archiving all events: {}", args.archive_all());
     } else {
-        log::info!("archiving all events:           {}", args.compress_all());
+        log::info!("archiving all events:           {}", args.archive_all());
         log::info!("archiving P2P messages:         {}", args.messages);
         log::info!("archiving P2P connections:      {}", args.connections);
         log::info!("archiving mempool events:       {}", args.mempool);
@@ -386,13 +388,23 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
                         }
                     };
                     if should_archive(&event, &args){
-                        current_file.write_event(&event)?;
+                        if let Err(e) = current_file.write_event(&event) {
+                            log::error!("failed to write event: {}", e);
+                            break;
+                        }
 
                         if current_file.needs_rotation(args.max_file_size) {
-                            let (total_file_events, new_file) = rotate(current_file, &args)?;
-                            total_events += total_file_events;
-                            total_files += 1;
-                            current_file = new_file
+                            match rotate(current_file, &args) {
+                                Ok((file_events, new_file)) => {
+                                    total_events += file_events;
+                                    total_files += 1;
+                                    current_file = new_file;
+                                }
+                                Err(e) => {
+                                    log::error!("failed to rotate archive: {}", e);
+                                    return Err(e.into());
+                                }
+                            }
                         }
                     }
                 } else {
@@ -457,7 +469,7 @@ fn rotate(current_file: ArchiveFile, args: &Args) -> std::io::Result<(u64, Archi
 }
 
 fn should_archive(event: &Event, args: &Args) -> bool {
-    if args.compress_all() {
+    if args.archive_all() {
         return true;
     }
     match event_type_name(event) {
