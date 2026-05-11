@@ -52,12 +52,13 @@ pub fn read_archive(path: &Path) -> std::io::Result<Archive> {
     let mut events = Vec::new();
 
     while cursor < data.len() {
-        let event = Event::decode_length_delimited(&data[cursor..]).map_err(|e| {
-            std::io::Error::other(format!("decode error at byte {}: {}", cursor, e))
-        })?;
-        let size = event.encoded_len();
-        let varint_len = shared::prost::length_delimiter_len(size);
-        cursor += varint_len + size;
+        let mut wire = &data[cursor..];
+        let payload_len = shared::prost::decode_length_delimiter(&mut wire)
+            .map_err(|e| std::io::Error::other(format!("bad length at byte {cursor}: {e}")))?;
+        let varint_len = (data.len() - cursor) - wire.len();
+        let event = Event::decode(&data[cursor + varint_len..cursor + varint_len + payload_len])
+            .map_err(|e| std::io::Error::other(format!("decode error at byte {cursor}: {e}")))?;
+        cursor += varint_len + payload_len;
         events.push(event);
     }
 
