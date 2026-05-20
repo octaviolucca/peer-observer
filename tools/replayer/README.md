@@ -1,32 +1,34 @@
 # `replayer`
 
-Reads peer-observer archive files and prints decoded events to stdout.
-
-Supports:
-- `.bin`
-- `.bin.zst`
+Reads peer-observer archive files (`.bin` or `.bin.zst`) and prints decoded
+events to stdout.
 
 ## Usage
 
 ```bash
-cargo run -p replayer -- archive/test.0.bin
-cargo run -p replayer -- archive/test.0.bin.zst
-cargo run -p replayer -- archive/test.0.bin archive/test.1.bin.zst
+# print decoded events
+cargo run -p replayer -- archive.0.bin.zst
+
+# multiple files
+cargo run -p replayer -- archive.0.bin.zst archive.1.bin.zst
+
+# list peers sorted by message count
+cargo run -p replayer -- archive.0.bin.zst --list-peers
+
+# generate a mermaid sequence diagram
+cargo run -p replayer -- archive.0.bin.zst --sequence-diagram
+
+# filter diagram to specific peers
+cargo run -p replayer -- archive.0.bin.zst --sequence-diagram --peer 1 --peer 3
+
+# write diagram as self-contained HTML
+cargo run -p replayer -- archive.0.bin.zst --sequence-diagram --html diagram.html
+
+# write P2P events as CSV
+cargo run -p replayer -- archive.0.bin.zst --csv events.csv
+
+# filter events by timestamp (milliseconds)
+cargo run -p replayer -- archive.0.bin.zst --from 1703001600000 --to 1703001700000
 ```
 
-## Example output
-
-```text
-header: version=1 git=abcd1234
-[1] ts=1234567890 ebpf: ...
-[2] ts=1234567891 ebpf: ...
-total: 2 events
-```
-
-## Help
-
-```
-Read and display peer-observer archive files
-
-Usage: replayer <file.bin[.zst]> [file2.bin[.zst] ...]
-```
+Note: `--sequence-diagram`, `--html`, and `--csv` only work with a single archive file.
