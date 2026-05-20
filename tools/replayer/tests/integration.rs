@@ -416,6 +416,124 @@ fn test_from_to_filter_with_sequence_diagram() {
     assert!(!stdout.contains("P10"));
 }
 
+// --- msg-type filter ---
+
+#[test]
+fn test_msg_type_filter() {
+    let events = vec![
+        make_msg_event(1, "ping", true, 8, Some(Msg::Ping(Ping { value: 1 }))),
+        make_msg_event(2, "pong", false, 8, Some(Msg::Pong(Pong { value: 1 }))),
+        make_msg_event(1, "inv", true, 100, None),
+    ];
+    let path = write_archive("msg-type-filter.bin", &events);
+    let output = replayer()
+        .arg("--msg-type")
+        .arg("ping")
+        .arg(path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("total: 1 events"));
+}
+
+#[test]
+fn test_msg_type_filter_comma_separated() {
+    let events = vec![
+        make_msg_event(1, "ping", true, 8, Some(Msg::Ping(Ping { value: 1 }))),
+        make_msg_event(2, "pong", false, 8, Some(Msg::Pong(Pong { value: 1 }))),
+        make_msg_event(1, "inv", true, 100, None),
+    ];
+    let path = write_archive("msg-type-comma.bin", &events);
+    let output = replayer()
+        .arg("--msg-type")
+        .arg("ping,pong")
+        .arg(path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("total: 2 events"));
+}
+
+#[test]
+fn test_msg_type_filter_with_sequence_diagram() {
+    let events = vec![
+        make_msg_event_ts(1000, 5, "ping", true, 8, Some(Msg::Ping(Ping { value: 1 }))),
+        make_msg_event_ts(
+            2000,
+            5,
+            "pong",
+            false,
+            8,
+            Some(Msg::Pong(Pong { value: 1 })),
+        ),
+        make_msg_event_ts(3000, 5, "inv", true, 100, None),
+    ];
+    let path = write_archive("msg-type-seq.bin", &events);
+    let output = replayer()
+        .arg("--sequence-diagram")
+        .arg("--msg-type")
+        .arg("ping")
+        .arg(path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("ping"));
+    assert!(!stdout.contains("pong"));
+    assert!(!stdout.contains("inv"));
+}
+
+#[test]
+fn test_msg_type_filter_with_csv() {
+    let events = vec![
+        make_msg_event_ts(1000, 1, "ping", true, 8, Some(Msg::Ping(Ping { value: 1 }))),
+        make_msg_event_ts(
+            2000,
+            1,
+            "pong",
+            false,
+            8,
+            Some(Msg::Pong(Pong { value: 1 })),
+        ),
+        make_msg_event_ts(3000, 1, "inv", true, 100, None),
+    ];
+    let archive_path = write_archive("msg-type-csv.bin", &events);
+    let csv_path = std::env::temp_dir().join("replayer-integ-msg-type.csv");
+    let output = replayer()
+        .arg("--csv")
+        .arg(&csv_path)
+        .arg("--msg-type")
+        .arg("ping,inv")
+        .arg(archive_path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let csv = std::fs::read_to_string(&csv_path).unwrap();
+    let lines: Vec<&str> = csv.lines().collect();
+    assert_eq!(lines.len(), 3); // header + 2 rows
+    assert!(lines[1].contains("ping"));
+    assert!(lines[2].contains("inv"));
+}
+
+#[test]
+fn test_msg_type_filter_no_match() {
+    let events = vec![make_msg_event(
+        1,
+        "ping",
+        true,
+        8,
+        Some(Msg::Ping(Ping { value: 1 })),
+    )];
+    let path = write_archive("msg-type-nomatch.bin", &events);
+    let output = replayer()
+        .arg("--msg-type")
+        .arg("tx")
+        .arg(path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("total: 0 events"));
+}
+
 // --- list-peers ---
 
 #[test]

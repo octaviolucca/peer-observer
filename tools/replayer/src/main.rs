@@ -37,6 +37,10 @@ struct Args {
     #[arg(long, conflicts_with_all = ["sequence_diagram", "list_peers"])]
     csv: Option<PathBuf>,
 
+    /// Filter to specific message types, comma-separated (e.g. ping,inv,tx).
+    #[arg(long, value_delimiter = ',')]
+    msg_type: Vec<String>,
+
     /// Only include events with timestamp >= this value (milliseconds).
     #[arg(long)]
     from: Option<u64>,
@@ -77,6 +81,18 @@ fn main() {
                     archive
                         .events
                         .retain(|event| (from..=to).contains(&event.timestamp));
+                }
+                if !args.msg_type.is_empty() {
+                    archive.events.retain(|event| {
+                        if let Some(PeerObserverEvent::EbpfExtractor(ebpf)) =
+                            &event.peer_observer_event
+                        {
+                            if let Some(ebpf::EbpfEvent::Message(msg)) = &ebpf.ebpf_event {
+                                return args.msg_type.iter().any(|t| t == &msg.meta.command);
+                            }
+                        }
+                        false
+                    });
                 }
                 if let Some(csv_path) = &args.csv {
                     write_csv(csv_path, &archive);
