@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use shared::clap;
@@ -31,6 +33,10 @@ struct Args {
     #[arg(long, conflicts_with = "sequence_diagram")]
     list_peers: bool,
 
+    /// Write P2P events as CSV to a file.
+    #[arg(long, conflicts_with_all = ["sequence_diagram", "list_peers"])]
+    csv: Option<PathBuf>,
+
     /// Only include events with timestamp >= this value (milliseconds).
     #[arg(long)]
     from: Option<u64>,
@@ -53,6 +59,11 @@ fn main() {
         std::process::exit(1);
     }
 
+    if args.csv.is_some() && args.files.len() > 1 {
+        eprintln!("error: --csv only supports a single archive file");
+        std::process::exit(1);
+    }
+
     let multiple_files = args.files.len() > 1;
     for path in &args.files {
         if multiple_files {
@@ -67,7 +78,9 @@ fn main() {
                         .events
                         .retain(|event| (from..=to).contains(&event.timestamp));
                 }
-                if args.list_peers {
+                if let Some(csv_path) = &args.csv {
+                    write_csv(csv_path, &archive);
+                } else if args.list_peers {
                     print_peers(&archive);
                 } else if args.sequence_diagram {
                     let mermaid = build_sequence_diagram(&archive, &args.peer);
@@ -124,6 +137,43 @@ fn print_events(archive: &replayer::Archive) {
         }
     }
     println!("total: {} events", archive.events.len());
+}
+
+fn csv_escape(field: &str) -> String {
+    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+fn write_csv(path: &Path, archive: &replayer::Archive) {
+    let write = || -> std::io::Result<()> {
+        let mut file = File::create(path)?;
+        writeln!(file, "timestamp,peer_id,addr,command,direction,size")?;
+        for event in &archive.events {
+            if let Some(PeerObserverEvent::EbpfExtractor(ebpf)) = &event.peer_observer_event {
+                if let Some(ebpf::EbpfEvent::Message(msg)) = &ebpf.ebpf_event {
+                    writeln!(
+                        file,
+                        "{},{},{},{},{},{}",
+                        event.timestamp,
+                        msg.meta.peer_id,
+                        csv_escape(&msg.meta.addr),
+                        csv_escape(&msg.meta.command),
+                        if msg.meta.inbound { "in" } else { "out" },
+                        msg.meta.size,
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    };
+    if let Err(e) = write() {
+        eprintln!("error writing {}: {}", path.display(), e);
+        std::process::exit(1);
+    }
+    eprintln!("wrote {}", path.display());
 }
 
 fn collect_peers(archive: &replayer::Archive, peer_filter: &[u64]) -> HashMap<u64, Peer> {
@@ -532,5 +582,27 @@ mod tests {
         assert!(!label.contains('<'));
         assert!(!label.contains('>'));
         assert!(label.contains("&lt;script&gt;"));
+    }
+
+    // --- csv_escape ---
+
+    #[test]
+    fn test_csv_escape_plain() {
+        assert_eq!(csv_escape("127.0.0.1:8333"), "127.0.0.1:8333");
+    }
+
+    #[test]
+    fn test_csv_escape_comma() {
+        assert_eq!(csv_escape("a,b"), "\"a,b\"");
+    }
+
+    #[test]
+    fn test_csv_escape_quotes() {
+        assert_eq!(csv_escape("say \"hello\""), "\"say \"\"hello\"\"\"");
+    }
+
+    #[test]
+    fn test_csv_escape_newline() {
+        assert_eq!(csv_escape("line1\nline2"), "\"line1\nline2\"");
     }
 }
