@@ -133,5 +133,13 @@ total: 2 events
 ```
 Read and display peer-observer archive files
 
-Usage: replayer <file.bin[.zst]> [file2.bin[.zst] ...]
+Usage: replayer [OPTIONS] <FILE>...
+
+Arguments:
+  <FILE>...  Archive files to read
+
+Options:
+  -l, --log-level <LOG_LEVEL>  The log level the tool should run on [default: INFO]
+  -h, --help                   Print help
+  -V, --version                Print version
 ```
