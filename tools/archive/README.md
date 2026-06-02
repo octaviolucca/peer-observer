@@ -104,7 +104,7 @@ Options:
 
 ## replayer
 
-Reads peer-observer archive files and prints decoded events to stdout.
+Reads peer-observer archive files and logs decoded events at info level.
 
 Supports:
 - `.bin`
@@ -119,13 +119,13 @@ Supports:
   
 ```
 
-### Example output
+### Example log output
 
 ```text
-header: ArchiveHeader(created=1780140481)
-[1] ts=1234567890 ebpf: ...
-[2] ts=1234567891 ebpf: ...
-total: 2 events
+INFO [replayer] header: ArchiveHeader(created=1780140481)
+INFO [replayer] [1] ts=1234567890 ebpf: ...
+INFO [replayer] [2] ts=1234567891 ebpf: ...
+INFO [replayer] total: 2 events
 ```
 
 ### Help
@@ -133,5 +133,13 @@ total: 2 events
 ```
 Read and display peer-observer archive files
 
-Usage: replayer <file.bin[.zst]> [file2.bin[.zst] ...]
+Usage: replayer [OPTIONS] <FILE>...
+
+Arguments:
+  <FILE>...  Archive files to read
+
+Options:
+  -l, --log-level <LOG_LEVEL>  The log level the tool should run on [default: INFO]
+  -h, --help                   Print help
+  -V, --version                Print version
 ```
