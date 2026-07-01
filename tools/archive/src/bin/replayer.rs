@@ -1,18 +1,16 @@
 use archive::replayer::{self, Args};
+use shared::anyhow::{Context, Result};
 use shared::clap::Parser;
 use shared::simple_logger;
-use std::process::ExitCode;
 
-fn main() -> ExitCode {
+fn main() -> Result<()> {
     let args = Args::parse();
 
-    if let Err(e) = simple_logger::init_with_level(args.log_level) {
-        eprintln!("replayer tool error: {}", e);
-    }
+    simple_logger::init_with_level(args.log_level).context("could not initialize logger")?;
 
     if replayer::run(&args) {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
+        std::process::exit(1);
     }
+
+    Ok(())
 }

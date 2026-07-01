@@ -1,4 +1,4 @@
-use archive::replayer::{self, Args, ReplayFileError};
+use archive::replayer::{self, Args};
 use shared::{
     log,
     prost::Message,
@@ -9,7 +9,7 @@ use shared::{
     },
 };
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -46,6 +46,10 @@ fn write_temp_archive(test_name: &str, bytes: Vec<u8>) -> PathBuf {
     path
 }
 
+fn assert_io_error_kind(error: &shared::anyhow::Error, kind: ErrorKind) {
+    assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), kind);
+}
+
 #[test]
 fn replays_valid_archive() {
     let path = write_temp_archive("valid", archive_bytes(&[test_event()]));
@@ -65,13 +69,11 @@ fn replays_valid_archive() {
 fn missing_header_is_an_archive_error() {
     let path = write_temp_archive("missing_header", Vec::new());
 
-    match replayer::replay_file(&path).unwrap_err() {
-        ReplayFileError::OpenArchive(source) => {
-            assert_eq!(source.kind(), ErrorKind::Other);
-            assert!(source.to_string().contains("missing header"));
-        }
-        other => panic!("expected OpenArchive error, got {other:?}"),
-    }
+    let error = replayer::replay_file(&path).unwrap_err();
+    assert_io_error_kind(&error, ErrorKind::Other);
+    let error = format!("{error:#}");
+    assert!(error.contains("reading archive"));
+    assert!(error.contains("missing header"));
 
     let _ = fs::remove_file(path);
 }
@@ -84,16 +86,9 @@ fn truncated_event_is_an_unexpected_eof() {
     bytes.extend(event_bytes);
     let path = write_temp_archive("truncated_event", bytes);
 
-    match replayer::replay_file(&path).unwrap_err() {
-        ReplayFileError::UnexpectedEof {
-            event_number,
-            source,
-        } => {
-            assert_eq!(event_number, 1);
-            assert_eq!(source.kind(), ErrorKind::UnexpectedEof);
-        }
-        other => panic!("expected UnexpectedEof error, got {other:?}"),
-    }
+    let error = replayer::replay_file(&path).unwrap_err();
+    assert_io_error_kind(&error, ErrorKind::UnexpectedEof);
+    assert!(format!("{error:#}").contains("error at event 1"));
 
     let _ = fs::remove_file(path);
 }
@@ -105,16 +100,9 @@ fn malformed_event_is_a_read_error() {
     bytes.push(0xff);
     let path = write_temp_archive("malformed_event", bytes);
 
-    match replayer::replay_file(&path).unwrap_err() {
-        ReplayFileError::ReadEvent {
-            event_number,
-            source,
-        } => {
-            assert_eq!(event_number, 1);
-            assert_eq!(source.kind(), ErrorKind::Other);
-        }
-        other => panic!("expected ReadEvent error, got {other:?}"),
-    }
+    let error = replayer::replay_file(&path).unwrap_err();
+    assert_io_error_kind(&error, ErrorKind::Other);
+    assert!(format!("{error:#}").contains("error at event 1"));
 
     let _ = fs::remove_file(path);
 }
