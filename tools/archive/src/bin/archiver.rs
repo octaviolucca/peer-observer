@@ -11,7 +11,7 @@ async fn main() -> Result<()> {
     simple_logger::init_with_level(args.log_level).context("could not initialize logger")?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let mut archiver_handle = tokio::spawn(run(args, shutdown_rx));
+    let mut archiver_handle = tokio::spawn(run(args, shutdown_rx, None));
 
     tokio::select! {
         _ = signal::ctrl_c() => {
