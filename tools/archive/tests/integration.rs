@@ -24,7 +24,12 @@ use shared::{
     },
     simple_logger,
     testing::{nats_publisher::NatsPublisherForTesting, nats_server::NatsServerForTesting},
-    tokio::{self, sync::watch, time::sleep},
+    tokio::{
+        self,
+        sync::{oneshot, watch},
+        task::JoinHandle,
+        time::sleep,
+    },
 };
 use std::{sync::Once, time::Duration};
 
@@ -211,6 +216,22 @@ fn make_all_event_types() -> Vec<(Event, &'static str)> {
     events
 }
 
+async fn wait_for_archiver_ready(
+    ready_rx: oneshot::Receiver<()>,
+    archiver_handle: &mut JoinHandle<()>,
+) {
+    tokio::select! {
+        result = ready_rx => result.expect("archiver should send readiness signal"),
+        result = archiver_handle => {
+            result.unwrap();
+            unreachable!("archiver task exited before sending readiness signal");
+        }
+        _ = sleep(Duration::from_secs(5)) => {
+            panic!("timed out waiting for archiver readiness signal");
+        }
+    }
+}
+
 async fn run_filter_test(flag: &str, expected_count: usize) {
     setup();
 
@@ -220,10 +241,11 @@ async fn run_filter_test(flag: &str, expected_count: usize) {
     let nats_server = NatsServerForTesting::new(&[]).await;
     let nats_publisher = NatsPublisherForTesting::new(nats_server.port).await;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (ready_tx, ready_rx) = oneshot::channel();
 
     let dir = tmp_dir.clone();
     let flag_owned = flag.to_string();
-    let archiver_handle = tokio::spawn(async move {
+    let mut archiver_handle = tokio::spawn(async move {
         let mut args = make_test_args(nats_server.port, &dir);
         match flag_owned.as_str() {
             "messages" => args.messages = true,
@@ -236,10 +258,10 @@ async fn run_filter_test(flag: &str, expected_count: usize) {
             "ipc_extractor" => args.ipc_extractor = true,
             _ => {} // archive_all
         }
-        run(args, shutdown_rx).await.unwrap();
+        run(args, shutdown_rx, Some(ready_tx)).await.unwrap();
     });
 
-    sleep(Duration::from_secs(1)).await;
+    wait_for_archiver_ready(ready_rx, &mut archiver_handle).await;
 
     let all_events = make_all_event_types();
     for (event, _label) in &all_events {
@@ -248,7 +270,7 @@ async fn run_filter_test(flag: &str, expected_count: usize) {
             .await;
     }
 
-    sleep(Duration::from_millis(500)).await;
+    nats_publisher.sync().await;
     shutdown_tx.send(true).unwrap();
     archiver_handle.await.unwrap();
 
@@ -318,16 +340,17 @@ async fn test_file_rotation_with_compression() {
     let nats_server = NatsServerForTesting::new(&[]).await;
     let nats_publisher = NatsPublisherForTesting::new(nats_server.port).await;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (ready_tx, ready_rx) = oneshot::channel();
 
     let dir = tmp_dir.clone();
-    let archiver_handle = tokio::spawn(async move {
+    let mut archiver_handle = tokio::spawn(async move {
         let mut args = make_test_args(nats_server.port, &dir);
         args.max_file_size = 1; // force rotation on every event
         args.compression_level = 1;
-        run(args, shutdown_rx).await.unwrap();
+        run(args, shutdown_rx, Some(ready_tx)).await.unwrap();
     });
 
-    sleep(Duration::from_secs(1)).await;
+    wait_for_archiver_ready(ready_rx, &mut archiver_handle).await;
 
     let all_events = make_all_event_types();
     for (event, _label) in &all_events {
@@ -336,7 +359,7 @@ async fn test_file_rotation_with_compression() {
             .await;
     }
 
-    sleep(Duration::from_millis(500)).await;
+    nats_publisher.sync().await;
     shutdown_tx.send(true).unwrap();
     archiver_handle.await.unwrap();
 
@@ -388,14 +411,15 @@ async fn test_replayer_roundtrip() {
     let nats_server = NatsServerForTesting::new(&[]).await;
     let nats_publisher = NatsPublisherForTesting::new(nats_server.port).await;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (ready_tx, ready_rx) = oneshot::channel();
 
     let dir = tmp_dir.clone();
-    let archiver_handle = tokio::spawn(async move {
+    let mut archiver_handle = tokio::spawn(async move {
         let args = make_test_args(nats_server.port, &dir);
-        run(args, shutdown_rx).await.unwrap();
+        run(args, shutdown_rx, Some(ready_tx)).await.unwrap();
     });
 
-    sleep(Duration::from_secs(1)).await;
+    wait_for_archiver_ready(ready_rx, &mut archiver_handle).await;
 
     let all_events = make_all_event_types();
     for (event, _) in &all_events {
@@ -404,7 +428,7 @@ async fn test_replayer_roundtrip() {
             .await;
     }
 
-    sleep(Duration::from_millis(500)).await;
+    nats_publisher.sync().await;
     shutdown_tx.send(true).unwrap();
     archiver_handle.await.unwrap();
 
@@ -438,15 +462,16 @@ async fn test_replayer_roundtrip_uncompressed() {
     let nats_server = NatsServerForTesting::new(&[]).await;
     let nats_publisher = NatsPublisherForTesting::new(nats_server.port).await;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (ready_tx, ready_rx) = oneshot::channel();
 
     let dir = tmp_dir.clone();
-    let archiver_handle = tokio::spawn(async move {
+    let mut archiver_handle = tokio::spawn(async move {
         let mut args = make_test_args(nats_server.port, &dir);
         args.compression_level = 0;
-        run(args, shutdown_rx).await.unwrap();
+        run(args, shutdown_rx, Some(ready_tx)).await.unwrap();
     });
 
-    sleep(Duration::from_secs(1)).await;
+    wait_for_archiver_ready(ready_rx, &mut archiver_handle).await;
 
     let all_events = make_all_event_types();
     for (event, _) in &all_events {
@@ -455,7 +480,7 @@ async fn test_replayer_roundtrip_uncompressed() {
             .await;
     }
 
-    sleep(Duration::from_millis(500)).await;
+    nats_publisher.sync().await;
     shutdown_tx.send(true).unwrap();
     archiver_handle.await.unwrap();
 
@@ -485,15 +510,16 @@ async fn test_no_compression() {
     let nats_server = NatsServerForTesting::new(&[]).await;
     let nats_publisher = NatsPublisherForTesting::new(nats_server.port).await;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let (ready_tx, ready_rx) = oneshot::channel();
 
     let dir = tmp_dir.clone();
-    let archiver_handle = tokio::spawn(async move {
+    let mut archiver_handle = tokio::spawn(async move {
         let mut args = make_test_args(nats_server.port, &dir);
         args.compression_level = 0;
-        run(args, shutdown_rx).await.unwrap();
+        run(args, shutdown_rx, Some(ready_tx)).await.unwrap();
     });
 
-    sleep(Duration::from_secs(1)).await;
+    wait_for_archiver_ready(ready_rx, &mut archiver_handle).await;
 
     let all_events = make_all_event_types();
     for (event, _) in &all_events {
@@ -502,7 +528,7 @@ async fn test_no_compression() {
             .await;
     }
 
-    sleep(Duration::from_millis(500)).await;
+    nats_publisher.sync().await;
     shutdown_tx.send(true).unwrap();
     archiver_handle.await.unwrap();
 
