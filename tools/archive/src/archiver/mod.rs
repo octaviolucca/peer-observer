@@ -3,7 +3,7 @@
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use time::macros::format_description;
 use time::OffsetDateTime;
@@ -20,6 +20,7 @@ use shared::protobuf::ebpf_extractor::ebpf;
 use shared::protobuf::event::event::PeerObserverEvent;
 use shared::protobuf::event::Event;
 use shared::tokio::sync::watch;
+use shared::tokio::time::Instant;
 use shared::zstd;
 
 struct TrackingWriter {
@@ -245,6 +246,11 @@ impl Args {
     }
 }
 
+/// How long to wait for the NATS subscription to drain before shutting down
+/// anyway. Draining never completes while the NATS server is unreachable, as
+/// the client reconnects instead of processing the unsubscribe.
+pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
     if args.archive_all() {
         log::info!("archiving all events: {}", args.archive_all());
@@ -279,6 +285,9 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             .context("creating the initial archive file")?;
 
     let mut total_files: u64 = 0;
+    let mut draining = false;
+    // Only read once draining is set below.
+    let mut drain_deadline = Instant::now();
 
     loop {
         shared::tokio::select! {
@@ -307,20 +316,36 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
                     break; // subscription ended
                 }
             }
-            res = shutdown_rx.changed() => {
+            res = shutdown_rx.changed(), if !draining => {
                 match res {
                     Ok(_) => {
                         if *shutdown_rx.borrow() {
-                            log::info!("archiver tool received shutdown signal.");
-                            break;
+                            log::info!("archiver tool received shutdown signal. Draining the subscription.");
+                            draining = true;
                         }
                     }
                     Err(_) => {
                         // all senders dropped -> treat as shutdown
-                        log::warn!("The shutdown notification sender was dropped. Shutting down.");
-                        break;
+                        log::warn!("The shutdown notification sender was dropped. Draining the subscription.");
+                        draining = true;
                     }
                 }
+                if draining {
+                    // Unsubscribes, but keeps the subscription open until all
+                    // in-flight messages have been yielded. Afterwards,
+                    // sub.next() returns None and the loop above breaks.
+                    if let Err(e) = sub.drain().await {
+                        log::warn!("failed to drain the NATS subscription: {}. Shutting down.", e);
+                        break;
+                    }
+                    drain_deadline = Instant::now() + DRAIN_TIMEOUT;
+                }
+            }
+            // The deadline is absolute, so re-creating this future on every
+            // loop iteration doesn't extend it.
+            _ = shared::tokio::time::sleep_until(drain_deadline), if draining => {
+                log::warn!("draining the NATS subscription timed out. Shutting down anyway.");
+                break;
             }
         }
     }
