@@ -279,6 +279,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
             .context("creating the initial archive file")?;
 
     let mut total_files: u64 = 0;
+    let mut draining = false;
 
     loop {
         shared::tokio::select! {
@@ -307,19 +308,25 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
                     break; // subscription ended
                 }
             }
-            res = shutdown_rx.changed() => {
+            res = shutdown_rx.changed(), if !draining => {
                 match res {
                     Ok(_) => {
                         if *shutdown_rx.borrow() {
-                            log::info!("archiver tool received shutdown signal.");
-                            break;
+                            log::info!("archiver tool received shutdown signal. Draining the subscription.");
+                            draining = true;
                         }
                     }
                     Err(_) => {
                         // all senders dropped -> treat as shutdown
-                        log::warn!("The shutdown notification sender was dropped. Shutting down.");
-                        break;
+                        log::warn!("The shutdown notification sender was dropped. Draining the subscription.");
+                        draining = true;
                     }
+                }
+                if draining {
+                    // Unsubscribes, but keeps the subscription open until all
+                    // in-flight messages have been yielded. Afterwards,
+                    // sub.next() returns None and the loop above breaks.
+                    sub.drain().await.context("draining the NATS subscription")?;
                 }
             }
         }
