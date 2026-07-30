@@ -19,7 +19,7 @@ use shared::protobuf::archive::ArchiveHeader;
 use shared::protobuf::ebpf_extractor::ebpf;
 use shared::protobuf::event::event::PeerObserverEvent;
 use shared::protobuf::event::Event;
-use shared::tokio::sync::watch;
+use shared::tokio::sync::{oneshot, watch};
 use shared::tokio::time::Instant;
 use shared::zstd;
 
@@ -251,7 +251,11 @@ impl Args {
 /// the client reconnects instead of processing the unsubscribe.
 pub const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<()> {
+pub async fn run(
+    args: Args,
+    mut shutdown_rx: watch::Receiver<bool>,
+    ready_tx: Option<oneshot::Sender<()>>,
+) -> Result<()> {
     if args.archive_all() {
         log::info!("archiving all events: {}", args.archive_all());
     } else {
@@ -283,6 +287,30 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
     let mut current_file =
         ArchiveFile::new(&args.output_dir, &args.base_name, args.compression_level)
             .context("creating the initial archive file")?;
+
+    if let Some(ready_tx) = ready_tx {
+        // A flush only empties the client's write buffer and does not wait for
+        // the server to have processed the subscription. Prove the subscription
+        // is registered by publishing a probe to an inbox subscribed on this
+        // same connection: the server handles the commands of a connection in
+        // order, so receiving the probe back implies the earlier "*"
+        // subscription is active. The probe inbox contains dots, so it's not
+        // matched by the single-token "*" subscription.
+        let inbox = nc.new_inbox();
+        let mut probe_sub = nc
+            .subscribe(inbox.clone())
+            .await
+            .context("subscribing to the readiness probe inbox")?;
+        nc.publish(inbox, "".into())
+            .await
+            .context("publishing the readiness probe")?;
+        nc.flush().await.context("flushing the readiness probe")?;
+        probe_sub
+            .next()
+            .await
+            .context("receiving the readiness probe")?;
+        let _ = ready_tx.send(());
+    }
 
     let mut total_files: u64 = 0;
     let mut draining = false;
