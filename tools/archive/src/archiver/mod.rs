@@ -17,6 +17,7 @@ use shared::nats_util;
 use shared::prost::Message;
 use shared::protobuf::archive::ArchiveHeader;
 use shared::protobuf::ebpf_extractor::ebpf;
+use shared::protobuf::ebpf_extractor::message::message_event::Msg;
 use shared::protobuf::event::event::PeerObserverEvent;
 use shared::protobuf::event::Event;
 use shared::tokio::sync::watch;
@@ -105,7 +106,12 @@ struct ArchiveFile {
 }
 
 impl ArchiveFile {
-    fn new(output_dir: &Path, base_name: &str, compression_level: u32) -> std::io::Result<Self> {
+    fn new(
+        output_dir: &Path,
+        base_name: &str,
+        compression_level: u32,
+        low_data: bool,
+    ) -> std::io::Result<Self> {
         let ext = if compression_level > 0 {
             "bin.zst"
         } else {
@@ -138,7 +144,7 @@ impl ArchiveFile {
             }
         };
         let mut writer = ArchiveWriter::new(file, compression_level)?;
-        let header_bytes = ArchiveHeader::new().to_bytes();
+        let header_bytes = ArchiveHeader::new(low_data).to_bytes();
         writer.write_all(&header_bytes)?;
         writer.flush()?;
 
@@ -229,6 +235,11 @@ pub struct Args {
     /// Zstd compression level (0 = no compression, 1-22). Default: 22 (ultra).
     #[arg(long, default_value_t = 22)]
     pub compression_level: u32,
+
+    /// If passed, don't archive raw transaction data and block contents.
+    /// Transactions keep their txid and wtxid, blocks keep their header.
+    #[arg(long)]
+    pub low_data: bool,
 }
 
 impl Args {
@@ -259,6 +270,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         log::info!("archiving log_extractor events: {}", args.log_extractor);
         log::info!("archiving ipc_extractor events: {}", args.ipc_extractor);
     }
+    log::info!("archiving in low-data mode: {}", args.low_data);
 
     let nc = nats_util::prepare_connection(&args.nats)
         .context("preparing NATS connection")?
@@ -274,9 +286,13 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
 
     fs::create_dir_all(&args.output_dir)
         .with_context(|| format!("creating output directory {}", args.output_dir.display()))?;
-    let mut current_file =
-        ArchiveFile::new(&args.output_dir, &args.base_name, args.compression_level)
-            .context("creating the initial archive file")?;
+    let mut current_file = ArchiveFile::new(
+        &args.output_dir,
+        &args.base_name,
+        args.compression_level,
+        args.low_data,
+    )
+    .context("creating the initial archive file")?;
 
     let mut total_files: u64 = 0;
 
@@ -284,7 +300,7 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
         shared::tokio::select! {
             maybe_msg = sub.next() => {
                 if let Some(msg) = maybe_msg {
-                    let event = match Event::decode(msg.payload.as_ref()) {
+                    let mut event = match Event::decode(msg.payload.as_ref()) {
                         Ok(event) => event,
                         Err(e) => {
                             log::warn!("failed to decode event: {}, skipping", e);
@@ -292,6 +308,10 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
                         }
                     };
                     if should_archive(&event, &args){
+                        if args.low_data {
+                            strip_low_data(&mut event);
+                        }
+
                         if let Err(e) = current_file.write_event(&event) {
                             log::error!("failed to write event: {}", e);
                             break;
@@ -338,8 +358,43 @@ pub async fn run(args: Args, mut shutdown_rx: watch::Receiver<bool>) -> Result<(
 fn rotate(current_file: ArchiveFile, args: &Args) -> std::io::Result<ArchiveFile> {
     log::trace!("rotating {:?}", current_file.path);
     current_file.finalize()?;
-    let new_file = ArchiveFile::new(&args.output_dir, &args.base_name, args.compression_level)?;
+    let new_file = ArchiveFile::new(
+        &args.output_dir,
+        &args.base_name,
+        args.compression_level,
+        args.low_data,
+    )?;
     Ok(new_file)
+}
+
+/// Removes the bulk of a P2P message: the raw bytes of transactions and the
+/// transactions of a block. Transactions keep their txid and wtxid, blocks keep
+/// their header, which includes the block hash. Messages that carry neither are
+/// left untouched.
+fn strip_low_data(event: &mut Event) {
+    let Some(PeerObserverEvent::EbpfExtractor(ebpf)) = event.peer_observer_event.as_mut() else {
+        return;
+    };
+    let Some(ebpf::EbpfEvent::Message(message_event)) = ebpf.ebpf_event.as_mut() else {
+        return;
+    };
+    let Some(msg) = message_event.msg.as_mut() else {
+        return;
+    };
+
+    match msg {
+        Msg::Tx(tx) => tx.tx.raw = None,
+        Msg::Block(block) => block.transactions.clear(),
+        Msg::Blocktxn(blocktxn) => blocktxn
+            .transactions
+            .iter_mut()
+            .for_each(|tx| tx.raw = None),
+        Msg::Compactblock(compact_block) => compact_block
+            .transactions
+            .iter_mut()
+            .for_each(|prefilled| prefilled.tx.raw = None),
+        _ => (),
+    }
 }
 
 fn should_archive(event: &Event, args: &Args) -> bool {
@@ -381,4 +436,187 @@ fn format_utc_timestamp(epoch_ms: u64) -> String {
         .expect("timestamp out of range")
         .format(&fmt)
         .expect("timestamp formatting failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use shared::protobuf::bitcoin_primitives::{BlockHeader, PrefilledTransaction, Transaction};
+    use shared::protobuf::ebpf_extractor::message::{
+        Block, BlockTxn, CompactBlock, Inv, MessageEvent, Metadata, Tx,
+    };
+    use shared::protobuf::ebpf_extractor::Ebpf;
+
+    const TXID: [u8; 32] = [0x11; 32];
+    const WTXID: [u8; 32] = [0x22; 32];
+    const TXID_2: [u8; 32] = [0x44; 32];
+    const WTXID_2: [u8; 32] = [0x55; 32];
+    const BLOCK_HASH: [u8; 32] = [0x33; 32];
+
+    fn transaction() -> Transaction {
+        transaction_with_ids(TXID, WTXID, 0xff)
+    }
+
+    fn transaction_with_ids(txid: [u8; 32], wtxid: [u8; 32], raw_byte: u8) -> Transaction {
+        Transaction {
+            txid: txid.to_vec(),
+            wtxid: wtxid.to_vec(),
+            raw: Some(vec![raw_byte; 500]),
+        }
+    }
+
+    fn block_header() -> BlockHeader {
+        BlockHeader {
+            version: 1,
+            prev_blockhash: vec![0u8; 32],
+            merkle_root: vec![0u8; 32],
+            time: 1234,
+            bits: 5678,
+            nonce: 42,
+            hash: BLOCK_HASH.to_vec(),
+        }
+    }
+
+    fn message_event(msg: Msg) -> Event {
+        Event::new(PeerObserverEvent::EbpfExtractor(Ebpf {
+            ebpf_event: Some(ebpf::EbpfEvent::Message(MessageEvent {
+                meta: Metadata {
+                    peer_id: 0,
+                    addr: "127.0.0.1:8333".to_string(),
+                    conn_type: 1,
+                    command: String::new(),
+                    inbound: true,
+                    size: 0,
+                },
+                msg: Some(msg),
+            })),
+        }))
+        .unwrap()
+    }
+
+    /// Returns the P2P message of an event, panicking if there is none.
+    fn msg_of(event: &Event) -> &Msg {
+        match event.peer_observer_event.as_ref().unwrap() {
+            PeerObserverEvent::EbpfExtractor(ebpf) => match ebpf.ebpf_event.as_ref().unwrap() {
+                ebpf::EbpfEvent::Message(message_event) => message_event.msg.as_ref().unwrap(),
+                _ => panic!("expected a P2P message event"),
+            },
+            _ => panic!("expected an ebpf event"),
+        }
+    }
+
+    #[test]
+    fn low_data_strips_tx_raw_and_keeps_ids() {
+        let mut event = message_event(Msg::Tx(Tx { tx: transaction() }));
+
+        strip_low_data(&mut event);
+
+        let Msg::Tx(tx) = msg_of(&event) else {
+            panic!("expected a tx message");
+        };
+        assert_eq!(tx.tx.raw, None);
+        assert_eq!(tx.tx.txid, TXID.to_vec());
+        assert_eq!(tx.tx.wtxid, WTXID.to_vec());
+    }
+
+    #[test]
+    fn low_data_keeps_block_header_and_drops_transactions() {
+        let mut event = message_event(Msg::Block(Block {
+            header: block_header(),
+            transactions: vec![transaction(), transaction()],
+        }));
+
+        strip_low_data(&mut event);
+
+        let Msg::Block(block) = msg_of(&event) else {
+            panic!("expected a block message");
+        };
+        assert!(block.transactions.is_empty());
+        assert_eq!(block.header.hash, BLOCK_HASH.to_vec());
+        assert_eq!(block.header.nonce, 42);
+    }
+
+    #[test]
+    fn low_data_strips_blocktxn_transaction_raw() {
+        let mut event = message_event(Msg::Blocktxn(BlockTxn {
+            block_hash: BLOCK_HASH.to_vec(),
+            transactions: vec![transaction(), transaction()],
+        }));
+
+        strip_low_data(&mut event);
+
+        let Msg::Blocktxn(blocktxn) = msg_of(&event) else {
+            panic!("expected a blocktxn message");
+        };
+        assert_eq!(blocktxn.block_hash, BLOCK_HASH.to_vec());
+        assert_eq!(blocktxn.transactions.len(), 2);
+        for tx in &blocktxn.transactions {
+            assert_eq!(tx.raw, None);
+            assert_eq!(tx.txid, TXID.to_vec());
+            assert_eq!(tx.wtxid, WTXID.to_vec());
+        }
+    }
+
+    #[test]
+    fn low_data_strips_compactblock_prefilled_transaction_raw() {
+        let mut event = message_event(Msg::Compactblock(CompactBlock {
+            header: block_header(),
+            nonce: 7,
+            short_ids: vec![vec![0xaa; 6]],
+            transactions: vec![
+                PrefilledTransaction {
+                    diff_index: 0,
+                    tx: transaction(),
+                },
+                PrefilledTransaction {
+                    diff_index: 2,
+                    tx: transaction_with_ids(TXID_2, WTXID_2, 0xee),
+                },
+            ],
+        }));
+
+        strip_low_data(&mut event);
+
+        let Msg::Compactblock(compact_block) = msg_of(&event) else {
+            panic!("expected a compactblock message");
+        };
+        assert_eq!(compact_block.nonce, 7);
+        assert_eq!(compact_block.short_ids, vec![vec![0xaa; 6]]);
+        assert_eq!(compact_block.header.hash, BLOCK_HASH.to_vec());
+        assert_eq!(compact_block.transactions.len(), 2);
+        assert_eq!(compact_block.transactions[0].diff_index, 0);
+        assert_eq!(compact_block.transactions[0].tx.raw, None);
+        assert_eq!(compact_block.transactions[0].tx.txid, TXID.to_vec());
+        assert_eq!(compact_block.transactions[0].tx.wtxid, WTXID.to_vec());
+        assert_eq!(compact_block.transactions[1].diff_index, 2);
+        assert_eq!(compact_block.transactions[1].tx.raw, None);
+        assert_eq!(compact_block.transactions[1].tx.txid, TXID_2.to_vec());
+        assert_eq!(compact_block.transactions[1].tx.wtxid, WTXID_2.to_vec());
+    }
+
+    #[test]
+    fn low_data_leaves_other_messages_untouched() {
+        let mut event = message_event(Msg::Inv(Inv { items: vec![] }));
+        let before = event.encode_to_vec();
+
+        strip_low_data(&mut event);
+
+        assert_eq!(event.encode_to_vec(), before);
+    }
+
+    #[test]
+    fn low_data_leaves_non_p2p_events_untouched() {
+        let mut event = Event::new(PeerObserverEvent::RpcExtractor(
+            shared::protobuf::rpc_extractor::Rpc {
+                rpc_event: Some(shared::protobuf::rpc_extractor::rpc::RpcEvent::Uptime(1234)),
+            },
+        ))
+        .unwrap();
+        let before = event.encode_to_vec();
+
+        strip_low_data(&mut event);
+
+        assert_eq!(event.encode_to_vec(), before);
+    }
 }

@@ -7,9 +7,10 @@ use std::fmt;
 include!(concat!(env!("OUT_DIR"), "/header.rs"));
 
 impl ArchiveHeader {
-    pub fn new() -> Self {
+    pub fn new(low_data: bool) -> Self {
         Self {
             created: current_timestamp(),
+            low_data: Some(low_data),
         }
     }
 
@@ -20,6 +21,16 @@ impl ArchiveHeader {
 
 impl fmt::Display for ArchiveHeader {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "ArchiveHeader(created={})", self.created,)
+        let low_data = match self.low_data {
+            Some(true) => "true",
+            Some(false) => "false",
+            // Archives written before the low_data field existed.
+            None => "unknown",
+        };
+        write!(
+            f,
+            "ArchiveHeader(created={}, low_data={})",
+            self.created, low_data
+        )
     }
 }
