@@ -8,11 +8,32 @@ use std::fs::File;
 use std::io::{self, BufReader, ErrorKind, Read};
 use std::path::Path;
 
+/// Original uncompressed bytes read from the archive, including unknown fields
+/// and the actual length delimiter (which need not use its shortest encoding).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameSize {
+    pub protobuf_bytes: usize,
+    pub delimiter_bytes: usize,
+}
+
+impl FrameSize {
+    pub fn framed_bytes(&self) -> usize {
+        self.protobuf_bytes + self.delimiter_bytes
+    }
+}
+
+#[derive(Debug)]
+pub struct ArchiveRecord {
+    pub event: Event,
+    pub size: FrameSize,
+}
+
 #[derive(Debug)]
 pub struct ArchiveReader<R> {
     reader: BufReader<R>,
     buf: Vec<u8>,
     pub header: ArchiveHeader,
+    header_size: FrameSize,
 }
 
 impl ArchiveReader<Box<dyn Read>> {
@@ -36,14 +57,25 @@ impl<R: Read> ArchiveReader<R> {
         let mut reader = BufReader::new(reader);
         let mut buf = Vec::new();
 
-        let header = read_message(&mut reader, &mut buf)?
+        let (header, header_size) = read_message(&mut reader, &mut buf)?
             .ok_or_else(|| io::Error::other("missing header"))?;
 
         Ok(Self {
             reader,
             buf,
             header,
+            header_size,
         })
+    }
+
+    pub fn header_size(&self) -> FrameSize {
+        self.header_size
+    }
+
+    pub fn next_record(&mut self) -> Option<io::Result<ArchiveRecord>> {
+        read_message(&mut self.reader, &mut self.buf)
+            .transpose()
+            .map(|result| result.map(|(event, size)| ArchiveRecord { event, size }))
     }
 }
 
@@ -51,28 +83,35 @@ impl<R: Read> Iterator for ArchiveReader<R> {
     type Item = io::Result<Event>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        read_message(&mut self.reader, &mut self.buf).transpose()
+        self.next_record()
+            .map(|result| result.map(|record| record.event))
     }
 }
 
 fn read_message<M: Message + Default>(
     reader: &mut impl Read,
     buf: &mut Vec<u8>,
-) -> io::Result<Option<M>> {
-    let len = match read_length_delimiter(reader)? {
-        Some(len) => len,
+) -> io::Result<Option<(M, FrameSize)>> {
+    let (protobuf_bytes, delimiter_bytes) = match read_length_delimiter(reader)? {
+        Some(length) => length,
         // A clean EOF at a message boundary is the normal end of the archive.
         None => return Ok(None),
     };
 
     buf.clear();
-    buf.resize(len, 0);
+    buf.resize(protobuf_bytes, 0);
 
     reader.read_exact(buf)?;
 
     let msg = M::decode(&buf[..]).map_err(io::Error::other)?;
 
-    Ok(Some(msg))
+    Ok(Some((
+        msg,
+        FrameSize {
+            protobuf_bytes,
+            delimiter_bytes,
+        },
+    )))
 }
 
 /// Reads a protobuf varint length prefix from `reader`.
@@ -84,15 +123,15 @@ fn read_message<M: Message + Default>(
 /// has to be pulled off the stream first. Its encoded length is not known up
 /// front, so we read one byte at a time until the varint's continuation bit
 /// clears and hand the collected bytes to prost to decode.
-fn read_length_delimiter(reader: &mut impl Read) -> io::Result<Option<usize>> {
+fn read_length_delimiter(reader: &mut impl Read) -> io::Result<Option<(usize, usize)>> {
     let mut bytes = Vec::with_capacity(10);
     loop {
         let mut byte = [0u8; 1];
-        match reader.read_exact(&mut byte) {
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::UnexpectedEof && bytes.is_empty() => {
-                return Ok(None);
-            }
+        match reader.read(&mut byte) {
+            Ok(0) if bytes.is_empty() => return Ok(None),
+            Ok(0) => return Err(io::Error::from(ErrorKind::UnexpectedEof)),
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         }
         bytes.push(byte[0]);
@@ -106,7 +145,7 @@ fn read_length_delimiter(reader: &mut impl Read) -> io::Result<Option<usize>> {
     }
 
     decode_length_delimiter(&mut bytes.as_slice())
-        .map(Some)
+        .map(|length| Some((length, bytes.len())))
         .map_err(io::Error::other)
 }
 
@@ -131,7 +170,7 @@ mod tests {
     #[test]
     fn reads_single_byte_length_prefix() {
         let mut reader = Cursor::new(vec![0x05]);
-        assert_eq!(read_length_delimiter(&mut reader).unwrap(), Some(5));
+        assert_eq!(read_length_delimiter(&mut reader).unwrap(), Some((5, 1)));
     }
 
     #[test]
@@ -139,7 +178,7 @@ mod tests {
         // 300 encodes as the two-byte varint [0xAC, 0x02]. A prefix split across
         // reads must still decode to the full value.
         let mut reader = Trickle(Cursor::new(vec![0xAC, 0x02]));
-        assert_eq!(read_length_delimiter(&mut reader).unwrap(), Some(300));
+        assert_eq!(read_length_delimiter(&mut reader).unwrap(), Some((300, 2)));
     }
 
     #[test]
@@ -160,7 +199,7 @@ mod tests {
     fn read_message_returns_none_on_clean_eof() {
         let mut reader = BufReader::new(Cursor::new(Vec::new()));
         let mut buf = Vec::new();
-        let msg: Option<ArchiveHeader> = read_message(&mut reader, &mut buf).unwrap();
+        let msg: Option<(ArchiveHeader, FrameSize)> = read_message(&mut reader, &mut buf).unwrap();
         assert!(msg.is_none());
     }
 }
