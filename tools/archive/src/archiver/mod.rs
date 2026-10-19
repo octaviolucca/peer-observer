@@ -233,8 +233,8 @@ pub struct Args {
     #[arg(long)]
     pub ipc_extractor: bool,
 
-    /// Zstd compression level (0 = no compression, 1-22). Default: 22 (ultra).
-    #[arg(long, default_value_t = 22)]
+    /// Zstd compression level (0 = no compression, 1-22).
+    #[arg(long, default_value_t = 18)]
     pub compression_level: u32,
 
     /// If passed, don't archive raw transaction data.
