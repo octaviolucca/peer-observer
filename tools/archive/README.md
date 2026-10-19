@@ -27,9 +27,11 @@ protobuf messages are encoded using `encode_length_delimited` from `prost`.
 
 Archive files are compressed with zstd using streaming compression — the writer is wrapped in a
 `zstd::Encoder`, so files are written as `.bin.zst` directly. The default compression level is
-22 (ultra). Use `--compression-level 3` for faster compression (~5x ratio)
-or `--compression-level 0` to skip compression. Rotation (`--max-file-size`) is checked against
-the compressed output stream. May overshoot slightly due to zstd internal buffering.
+18. Higher levels compress only slightly better but use a lot more CPU and memory: level 22
+(ultra) produced ~4% smaller files than 18 on real archives, at ~2.8x the compression time and
+~835 MB instead of ~60 MB peak memory. Use `--compression-level 3` for faster compression
+(~5x ratio) or `--compression-level 0` to skip compression. Rotation (`--max-file-size`) is
+checked against the compressed output stream. May overshoot slightly due to zstd internal buffering.
 
 ### Low-data mode
 
@@ -76,8 +78,7 @@ $ cargo run --bin archiver -- \
     --nats-address 127.0.0.1:4222 \
     --output-dir ./archive \
     --base-name mainnet \
-    --max-file-size 104857600 \
-    --compression-level 22
+    --max-file-size 104857600
 ```
 
 Archive only P2P messages and mempool events:
@@ -130,7 +131,7 @@ Options:
       --ipc-extractor
           If passed, archive ipc-extractor events
       --compression-level <COMPRESSION_LEVEL>
-              Zstd compression level (0 = no compression, 1-22). Default: 22 (ultra) [default: 22]
+          Zstd compression level (0 = no compression, 1-22) [default: 18]
       --low-data
           If passed, don't archive raw transaction data. Requires --messages. Other enabled event filters are archived unchanged. Transactions keep their txid and wtxid. Blocks keep only their header
       --addr-relay
