@@ -12,6 +12,7 @@ use std::path::Path;
 pub struct ArchiveReader<R> {
     reader: BufReader<R>,
     buf: Vec<u8>,
+    done: bool,
     pub header: ArchiveHeader,
 }
 
@@ -42,6 +43,7 @@ impl<R: Read> ArchiveReader<R> {
         Ok(Self {
             reader,
             buf,
+            done: false,
             header,
         })
     }
@@ -51,9 +53,21 @@ impl<R: Read> Iterator for ArchiveReader<R> {
     type Item = io::Result<Event>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        read_message(&mut self.reader, &mut self.buf).transpose()
+        if self.done {
+            return None;
+        }
+        // Stop after the first error or the end of the archive: the reader
+        // may keep returning the same error (zstd does after an incomplete
+        // frame), and the stream position after an error is unreliable.
+        let item = read_message(&mut self.reader, &mut self.buf).transpose();
+        if !matches!(item, Some(Ok(_))) {
+            self.done = true;
+        }
+        item
     }
 }
+
+impl<R: Read> std::iter::FusedIterator for ArchiveReader<R> {}
 
 fn read_message<M: Message + Default>(
     reader: &mut impl Read,
@@ -222,6 +236,8 @@ mod tests {
             .expect("an incomplete frame should not look like a clean EOF")
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        // The iterator ends after the error instead of repeating it.
+        assert!(archive.next().is_none());
     }
 
     #[test]
