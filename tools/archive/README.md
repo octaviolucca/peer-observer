@@ -10,6 +10,46 @@ A peer-observer tool that subscribes to a NATS server and persists events to bin
 By default, all event types are archived. Events can be filtered by type using flags, allowing
 multiple archiver instances to run simultaneously for different recording jobs.
 
+### NATS subjects
+
+By default, the archiver subscribes to the NATS subject `*`, which matches every subject the
+extractors publish to (`netmsg`, `netconn`, `mempool`, `validation`, `rpc`, `ipc`, `p2p-extractor`,
+and `log-extractor`, see `shared/src/nats_subjects.rs`). `--nats-subject` replaces it with one or
+more subjects of your choice, e.g. `--nats-subject netmsg rpc`. Quote the wildcard as
+`--nats-subject '*'`, so that the shell doesn't expand it.
+
+The subjects decide which events are **downloaded** from the NATS server; the event filters below
+(`--messages`, `--rpc`, ...) decide which of the downloaded events are **written** to disk. The NATS
+server only sends the events matching a subscription, so leaving out subjects saves bandwidth, while
+a filter alone still receives every event and drops the unwanted ones afterwards. This matters when
+archiving from a remote NATS server: the `rpc` events, for example, are few but large (several MB
+each) and can make up most of the traffic.
+
+Only single-token subjects, like `netmsg`, and `*` are supported, which covers all of today's
+subjects. Multi-token wildcards, like `>`, would also match NATS reply inboxes and other traffic
+that isn't peer-observer events. Multi-token subjects are to be revisited with the subject renaming
+in [#313](https://github.com/peer-observer/peer-observer/issues/313).
+
+NATS delivers a message once per matching subscription. To not archive an event twice, a repeated
+subject is subscribed to only once, and `*` can't be combined with other subjects.
+
+For example, two archivers recording from a remote NATS server, one without the RPC events and one
+with only the RPC events:
+
+```
+$ cargo run --bin archiver -- \
+    --nats-address demo.peer.observer:45324 \
+    --output-dir ./archive \
+    --base-name no-rpc \
+    --nats-subject netmsg netconn mempool validation ipc p2p-extractor log-extractor
+
+$ cargo run --bin archiver -- \
+    --nats-address demo.peer.observer:45324 \
+    --output-dir ./archive \
+    --base-name rpc \
+    --nats-subject rpc
+```
+
 ### File format
 
 Events are stored as sequential length-delimited protobuf events from `protobuf/event.proto`,
@@ -105,6 +145,8 @@ Options:
           The NATS password the extractor/tool should try to authentificate to the NATS server with
   -f, --nats-password-file <PASSWORD_FILE>
           A path to a file containing a password the extractor/tool should try to authentificate to the NATS server with
+      --nats-subject <SUBJECT>...
+          NATS subjects to subscribe to: single-token subjects, like "netmsg", or "*". Replaces the default "*"; pass several subjects at once, e.g. "--nats-subject netmsg rpc", or repeat the flag. Decides which events are downloaded from the NATS server, while the event filters below decide which of them are archived. Exact repeats are ignored. "*" can't be combined with other subjects, as NATS would deliver their events twice [default: *]
   -o, --output-dir <OUTPUT_DIR>
           Output directory for archive files
   -b, --base-name <BASE_NAME>
